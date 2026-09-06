@@ -1,2 +1,4 @@
 *.tif
 .corpus/
+__pycache__/
+*.aux.xml
