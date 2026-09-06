@@ -51,6 +51,8 @@ rustc --test src/colormap.rs -o /tmp/c && /tmp/c
   matching row out of the README's gap table in the same change.
 - When you add a feature, add its assertion to `check.py`. That is what stops
   the parity table from outrunning what actually works.
+- A fixture that renders a blank tile fails. If it is *legitimately* empty, put
+  it in `ALL_NODATA` with the evidence — not in `KNOWN_GAPS`.
 
 Timing claims come from the `Server-Timing` header on a real remote COG, not
 from a fixture on localhost.

@@ -94,6 +94,19 @@ the STAC surface, and the OpenAPI schema FastAPI generates for free.
 | `tileMatrixSetId` | no | WebMercatorQuad is assumed, not selected |
 | `tilesize` / `scale` | no | 256×256 fixed |
 
+### Coordinate systems
+
+EPSG-coded CRSs resolve from proj4rs's built-in table. A CRS written as
+GeoKey 32767 — the projection spelled out in individual geokeys rather than
+named, which is how USFS LCMS, NLCD and Vizzuality's Human Footprint all ship
+— is rebuilt into a proj string covering Transverse Mercator, Mercator,
+Lambert Conformal Conic (1SP and 2SP), Lambert Azimuthal Equal Area, Albers,
+Azimuthal Equidistant, Equidistant Conic, Stereographic, Polar Stereographic,
+Equirectangular and Sinusoidal, plus UTM named through `ProjectionGeoKey`.
+
+Still unsupported: a rotated or sheared raster, which carries a
+`ModelTransformation` instead of `ModelPixelScale` + `ModelTiepoint`.
+
 ### What has been verified
 
 - A tile from a Web Mercator COG is **byte-identical** to `gdalwarp -r near` over
@@ -104,6 +117,8 @@ the STAC surface, and the OpenAPI schema FastAPI generates for free.
 - `/cog/point` agrees with `gdallocationinfo -wgs84` exactly, and returns the
   same values for the same ground location across the 3857, 4326 and 32618
   builds of one scene — an independent check on the reprojection.
+- A reconstructed Albers proj string agrees with `gdaltransform` to
+  sub-millimetre, and `/cog/info` bounds match `gdalinfo` to eight decimals.
 - **Five of the eight** [source.coop reference COGs](https://github.com/source-cooperative/cog-viewer)
   render, across EPSG:4326, 32618, 2193 and 26918. The three that don't: one is
   `PlanarConfiguration=2`, one is a user-defined Albers (GeoKey 32767), and one is
@@ -139,8 +154,6 @@ encoding total 17–77 ms per tile.
 
 1. **ETag revalidation on the byte-range cache.** It is time-based today, so a
    COG overwritten in place under the same URL serves stale bytes for a day.
-2. **User-defined CRSs** — build a proj string from the individual geokeys when
-   the code is 32767. Albers and Lambert Conformal Conic cover most of it.
 3. **`/cog/preview` and `/cog/bbox`** — both fall out of generalising the tile
    pipeline to render an arbitrary window at an arbitrary size, which is worth
    doing on its own.
@@ -222,16 +235,19 @@ and colormaps producing colour.
 Its `KNOWN_GAPS` dict is **the gap list in executable form** — each entry names a
 fixture and why it cannot render. A file that fails without an entry is a
 regression and fails the run; a file that starts passing prints `FIXED` and tells
-you to delete its entry. Current state: **18 of 26 render, 8 declared gaps.**
+you to delete its entry. Current state: **20 of 26 render, 6 declared gaps.**
 
 | Gap | Fixture |
 |---|---|
-| GeoKey 32767 — proj string must be rebuilt from geokeys | `crs_user_defined`, `real_nlcd_landcover` |
 | `ModelTransformation` instead of `ModelPixelScale` | `crs_rotated_sar`, `layout_bigtiff_subifd` |
 | `PlanarConfiguration=2` band reassembly | `layout_planar` |
 | Stripped (non-tiled) TIFFs | `layout_stripped` |
 | LERC — the decoder is C, needs a wasm libc | `compress_lerc` |
 | JPEG-XL — `async-tiff` has no decoder | `compress_jpegxl` |
+
+A blank tile fails too, unless the fixture is listed in `ALL_NODATA` —
+`real_nlcd_landcover` is genuinely empty, which GDAL confirms with
+`VALID_PERCENT=0`.
 
 The pure-logic modules self-test without a wasm toolchain:
 
