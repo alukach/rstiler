@@ -1,0 +1,27 @@
+[package]
+name = "cf-geotiff-tileserver"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# wasm32 support (async_trait(?Send)) landed after the 0.3.0 release; pin main.
+async-tiff = { git = "https://github.com/developmentseed/async-tiff", rev = "573bbb324fb7ee61fab48b147a9dc72e49d2491b", default-features = false, features = ["lzma"] }
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+# pure-Rust WebP: async-tiff's own decoder is libwebp (C), which needs a wasm libc.
+image-webp = "0.2"
+png = "0.18"
+# default features pull in lazy_static/multi-thread, which wasm does not want.
+proj4rs = { version = "0.1.10", default-features = false, features = ["crs-definitions"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+worker = "0.8"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
