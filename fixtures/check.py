@@ -23,9 +23,12 @@ KNOWN_GAPS = {
     "layout_planar.tif":        "PlanarConfiguration=2 band reassembly",
     "layout_stripped.tif":      "stripped (non-tiled) TIFFs",
     "layout_bigtiff_subifd.tif": "SubIFD pyramid carries no ModelPixelScale",
-    "crs_user_defined.tif":     "GeoKey 32767; proj string must be rebuilt from geokeys",
-    "real_nlcd_landcover.tif":  "GeoKey 32767 (Albers)",
     "crs_rotated_sar.tif":      "ModelTransformation instead of ModelPixelScale",
+}
+
+# Fixtures whose tiles are legitimately blank, so an empty render is correct.
+ALL_NODATA = {
+    "real_nlcd_landcover.tif": "every pixel is nodata (GDAL agrees: VALID_PERCENT=0)",
 }
 
 
@@ -116,7 +119,9 @@ def sweep():
                 why = detail(body)
             else:
                 tj = json.loads(body.read_text())
-                z, x, y = center_tile(tj["bounds"], max(tj["minzoom"], min(tj["maxzoom"], tj["minzoom"] + 2)))
+                # Test near max zoom: minzoom is 0 for everything, and a tile there
+                # would be mostly empty space around a small fixture.
+                z, x, y = center_tile(tj["bounds"], max(tj["minzoom"], tj["maxzoom"] - 2))
                 code, body = curl(f"/cog/tiles/{z}/{x}/{y}.png?url={q}", "/tmp/check_tile.png")
                 if code != "200":
                     why = detail(body)
@@ -131,7 +136,14 @@ def sweep():
             print(f"  FIXED {name:<30} remove it from KNOWN_GAPS")
             fixed.append(name)
         else:
-            print(f"  ok    {name:<30} {opaque('/tmp/check_tile.png')} opaque px")
+            px = opaque("/tmp/check_tile.png")
+            if px == 0 and name not in ALL_NODATA:
+                print(f"  FAIL  {name:<30} rendered a blank tile")
+                regressions.append(name)
+            elif px == 0:
+                print(f"  ok    {name:<30} blank — {ALL_NODATA[name]}")
+            else:
+                print(f"  ok    {name:<30} {px} opaque px")
     return regressions, fixed
 
 
