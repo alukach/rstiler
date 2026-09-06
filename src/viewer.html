@@ -144,18 +144,34 @@ async function load() {
     nodata: info.nodata ?? "—",
   }).map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
 
-  // The tile endpoint defaults to 0–255; for anything that isn't 8-bit that is
-  // a black image, so fall back to the percentiles /cog/info measured.
   const q = new URLSearchParams({ url });
-  const bidx = $("bidx").value.trim();
+  const cmap = $("colormap").value;
+  let bidx = $("bidx").value.trim();
+  // A colormap needs exactly one band; take the first unless told otherwise.
+  if (cmap && !bidx) bidx = "1";
   if (bidx) q.set("bidx", bidx);
+  if (cmap) q.set("colormap_name", cmap);
+
+  // Tiles default to a 0–255 range. That is wrong for anything that isn't
+  // 8-bit, and wrong for the class rasters people reach for a colormap on —
+  // LCMS change classes run 0–16, which 0–255 squashes into one dark band.
+  // /cog/statistics is a separate call because on a COG without overviews it
+  // reads full-resolution data, so only ask when the range actually matters.
   let rescale = $("rescale").value.trim();
-  if (!rescale && info.band_ranges?.length) {
-    const picked = bidx ? bidx.split(",").map(n => +n - 1) :
-      (info.band_count >= 3 ? [0, 1, 2] : [0]);
-    rescale = picked.map(i => (info.band_ranges[i] ?? [0, 255])
-      .map(v => +v.toFixed(4)).join(",")).join(";");
-    $("rescale").placeholder = rescale;
+  const eightBit = info.sample_format === "Uint" && info.bits_per_sample?.[0] === 8;
+  if (!rescale && (!eightBit || cmap)) {
+    say("Sampling the data for a display range…", "ok");
+    try {
+      const stats = await (await fetch("/cog/statistics?url=" + encodeURIComponent(url))).json();
+      const picked = bidx ? bidx.split(",").map(n => +n)
+                          : (info.band_count >= 3 ? [1, 2, 3] : [1]);
+      rescale = picked
+        .map(i => stats[`b${i}`])
+        .filter(Boolean)
+        .map(b => `${+b.percentile_2.toFixed(4)},${+b.percentile_98.toFixed(4)}`)
+        .join(";");
+      $("rescale").placeholder = rescale;
+    } catch (e) { /* fall through to 0–255 */ }
   }
   if (rescale) q.set("rescale", rescale);
 
