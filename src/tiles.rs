@@ -32,7 +32,7 @@ pub(crate) async fn tile(
     let ifds = image_ifds(&tiff);
     let full = ifds[0];
     let t = transform_of(full)?;
-    let reproject = Reproject::new(source_crs(full)?)?;
+    let reproject = Reproject::new(&source_crs(full)?)?;
 
     if full.planar_configuration() != PlanarConfiguration::Chunky {
         // ponytail: planar TIFFs are rare in the wild; add band-plane

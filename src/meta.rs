@@ -4,7 +4,7 @@ use async_tiff::ImageFileDirectory;
 use worker::*;
 
 use crate::cog::{decoders, image_ifds, nodata_of, open, HttpReader};
-use crate::geo::{source_crs, transform_of, wgs84_bounds, Reproject};
+use crate::geo::{source_crs, transform_of, wgs84_bounds, Crs, Reproject};
 use crate::render::sample;
 use crate::{tiling, STATS_TILES, TILE};
 
@@ -13,7 +13,7 @@ pub(crate) async fn info(src: &str) -> Result<Response> {
     let ifds = image_ifds(&tiff);
     let ifd = ifds[0];
     let t = transform_of(ifd)?;
-    let code = source_crs(ifd)?;
+    let crs = source_crs(ifd)?;
     let bands = ifd.samples_per_pixel() as usize;
 
     Response::from_json(&serde_json::json!({
@@ -24,10 +24,10 @@ pub(crate) async fn info(src: &str) -> Result<Response> {
         "sample_format": ifd.sample_format().first().map(|f| format!("{f:?}")),
         "compression": format!("{:?}", ifd.compression()),
         "nodata": ifd.gdal_nodata(),
-        "crs": format!("EPSG:{code}"),
+        "crs": crs.label(),
         "overviews": ifds.len() - 1,
         "resolution": [t.res_x, t.res_y],
-        "bounds": wgs84_bounds(&t, code, ifd.image_width(), ifd.image_height())?,
+        "bounds": wgs84_bounds(&t, &crs, ifd.image_width(), ifd.image_height())?,
     }))
     .map(|r| timed(r, &reader))
 }
@@ -141,12 +141,12 @@ pub(crate) async fn tilejson(src: &str, req_url: &Url) -> Result<Response> {
     let ifds = image_ifds(&tiff);
     let ifd = ifds[0];
     let t = transform_of(ifd)?;
-    let code = source_crs(ifd)?;
-    let b = wgs84_bounds(&t, code, ifd.image_width(), ifd.image_height())?;
+    let crs = source_crs(ifd)?;
+    let b = wgs84_bounds(&t, &crs, ifd.image_width(), ifd.image_height())?;
 
     // Ground resolution at the image centre, in Web Mercator metres per pixel:
     // mercator stretches by 1/cos(lat), so a metre-based CRS needs scaling.
-    let merc_res = if code == 4326 {
+    let merc_res = if crs == Crs::WGS84 {
         t.res_x * tiling::R / 180.0 // degrees of longitude -> mercator metres
     } else {
         let lat = ((b[1] + b[3]) / 2.0).to_radians();
@@ -154,7 +154,11 @@ pub(crate) async fn tilejson(src: &str, req_url: &Url) -> Result<Response> {
     };
     let maxzoom =
         ((2.0 * tiling::R / (TILE as f64 * merc_res)).log2().round() as i64).clamp(0, 24);
-    let minzoom = (maxzoom - ifds.len() as i64).max(0);
+    // Serve from z0. The overview chain says where *detail* stops improving,
+    // not where tiles stop being available — clamping minzoom to the overview
+    // count leaves a client that fits the whole dataset with nothing to show.
+    // The real floor is MAX_SOURCE_TILES, which a too-shallow pyramid trips.
+    let minzoom = 0;
 
     let tiles = format!(
         "{}://{}/cog/tiles/{{z}}/{{x}}/{{y}}.png?{}",
@@ -196,9 +200,9 @@ pub(crate) async fn point(src: &str, coords: &str) -> Result<Response> {
     let ifds = image_ifds(&tiff);
     let ifd = ifds[0];
     let t = transform_of(ifd)?;
-    let code = source_crs(ifd)?;
+    let crs = source_crs(ifd)?;
 
-    let (wx, wy) = Reproject::between(4326, code)?
+    let (wx, wy) = Reproject::between(&Crs::WGS84, &crs)?
         .apply(lon, lat)
         .ok_or_else(|| Error::RustError("point is outside the CRS's domain".into()))?;
     let (fx, fy) = t.world_to_pixel(wx, wy, 1.0);

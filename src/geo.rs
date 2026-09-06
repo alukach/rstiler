@@ -1,27 +1,179 @@
 //! Everything CRS-shaped: reading the COG's projection, moving Web Mercator
 //! coordinates into it, and reporting geographic bounds.
 
+use async_tiff::geo::GeoKeyDirectory;
 use async_tiff::ImageFileDirectory;
 use worker::*;
 
 use crate::tiling::Transform;
 use crate::WEB_MERCATOR;
 
-/// Look up the COG's CRS. GeoTIFF stores it as an EPSG code in one of two
-/// geokeys; 32767 means "user-defined", which needs the projection rebuilt
-/// from the individual geokeys.
-pub(crate) fn source_crs(ifd: &ImageFileDirectory) -> Result<u16> {
+/// A coordinate reference system, however the GeoTIFF chose to describe it.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) enum Crs {
+    /// The ordinary case: an EPSG code, resolved from proj4rs's built-in table.
+    Epsg(u16),
+    /// GeoKey 32767 — the projection is spelled out in the individual geokeys
+    /// rather than named, so we rebuild a proj string from them.
+    Proj(String),
+}
+
+impl Crs {
+    pub(crate) const WGS84: Self = Crs::Epsg(4326);
+
+    pub(crate) fn label(&self) -> String {
+        match self {
+            Crs::Epsg(c) => format!("EPSG:{c}"),
+            Crs::Proj(s) => s.clone(),
+        }
+    }
+
+    fn proj(&self) -> Result<proj4rs::Proj> {
+        match self {
+            Crs::Epsg(c) => proj4rs::Proj::from_epsg_code(*c)
+                .map_err(|e| Error::RustError(format!("EPSG:{c} unsupported by proj4rs: {e:?}"))),
+            Crs::Proj(s) => proj4rs::Proj::from_proj_string(s)
+                .map_err(|e| Error::RustError(format!("proj4rs rejected {s:?}: {e:?}"))),
+        }
+    }
+}
+
+/// Look up the COG's CRS from its GeoKeyDirectory.
+pub(crate) fn source_crs(ifd: &ImageFileDirectory) -> Result<Crs> {
     let gk = ifd
         .geo_key_directory()
         .ok_or_else(|| Error::RustError("no GeoKeyDirectory: not a GeoTIFF".into()))?;
     match gk.projected_type.or(gk.geographic_type) {
-        Some(32767) | None => Err(Error::RustError(
-            // ponytail: rebuilding a proj string from proj_coord_trans and
-            // friends means a case per projection family. Add it when a
-            // user-defined CRS actually needs serving.
-            "user-defined CRS (geokey 32767); only EPSG-coded CRSs are supported".into(),
-        )),
-        Some(code) => Ok(code),
+        Some(32767) | None => Ok(Crs::Proj(proj_string_from_geokeys(gk)?)),
+        Some(code) => Ok(Crs::Epsg(code)),
+    }
+}
+
+/// Rebuild a proj string for a user-defined CRS.
+///
+/// GeoTIFF spells these out with ProjCoordTransGeoKey naming the projection
+/// method and a scatter of parameter geokeys. The parameters come in "natural
+/// origin", "false origin" and "center" spellings depending on the method and
+/// the writer, so each is looked up in turn.
+fn proj_string_from_geokeys(gk: &GeoKeyDirectory) -> Result<String> {
+    // A CRS can also name a *coded* projection instead of spelling out a
+    // method. 160xx / 161xx are the UTM zones, which is nearly all of them.
+    if gk.proj_coord_trans.is_none() {
+        if let Some(code) = gk.projection.filter(|c| *c != 32767) {
+            let (zone, hemi) = match code {
+                16001..=16060 => (code - 16000, "+north"),
+                16101..=16160 => (code - 16100, "+south"),
+                other => {
+                    return Err(Error::RustError(format!(
+                        "user-defined CRS names ProjectionGeoKey {other}, which is not implemented"
+                    )))
+                }
+            };
+            return Ok(format!(
+                "+proj=utm +zone={zone} {hemi} {} {} +no_defs",
+                datum_clause(gk),
+                units_clause(gk)
+            ));
+        }
+    }
+
+    let method = gk.proj_coord_trans.ok_or_else(|| {
+        Error::RustError(
+            "user-defined CRS with neither ProjCoordTransGeoKey nor ProjectionGeoKey".into(),
+        )
+    })?;
+
+    let lat0 = gk
+        .proj_false_origin_lat
+        .or(gk.proj_nat_origin_lat)
+        .or(gk.proj_center_lat)
+        .unwrap_or(0.0);
+    let lon0 = gk
+        .proj_false_origin_long
+        .or(gk.proj_nat_origin_long)
+        .or(gk.proj_center_long)
+        .or(gk.proj_straight_vert_pole_long)
+        .unwrap_or(0.0);
+    let x0 = gk
+        .proj_false_origin_easting
+        .or(gk.proj_false_easting)
+        .or(gk.proj_center_easting)
+        .unwrap_or(0.0);
+    let y0 = gk
+        .proj_false_origin_northing
+        .or(gk.proj_false_northing)
+        .or(gk.proj_center_northing)
+        .unwrap_or(0.0);
+    let k0 = gk.proj_scale_at_nat_origin.or(gk.proj_scale_at_center).unwrap_or(1.0);
+    let sp1 = gk.proj_std_parallel1.unwrap_or(lat0);
+    let sp2 = gk.proj_std_parallel2.unwrap_or(sp1);
+
+    // ProjCoordTransGeoKey codes, from the GeoTIFF specification.
+    let core = match method {
+        1 => format!("+proj=tmerc +lat_0={lat0} +lon_0={lon0} +k_0={k0}"),
+        7 => format!("+proj=merc +lat_ts={sp1} +lon_0={lon0}"),
+        8 => format!("+proj=lcc +lat_0={lat0} +lon_0={lon0} +lat_1={sp1} +lat_2={sp2}"),
+        9 => format!("+proj=lcc +lat_0={lat0} +lon_0={lon0} +lat_1={lat0} +lat_2={lat0} +k_0={k0}"),
+        10 => format!("+proj=laea +lat_0={lat0} +lon_0={lon0}"),
+        11 => format!("+proj=aea +lat_0={lat0} +lon_0={lon0} +lat_1={sp1} +lat_2={sp2}"),
+        12 => format!("+proj=aeqd +lat_0={lat0} +lon_0={lon0}"),
+        13 => format!("+proj=eqdc +lat_0={lat0} +lon_0={lon0} +lat_1={sp1} +lat_2={sp2}"),
+        14 => format!("+proj=stere +lat_0={lat0} +lon_0={lon0} +k_0={k0}"),
+        // Polar stereographic: the pole is implied by the sign of the origin.
+        15 => format!(
+            "+proj=stere +lat_0={} +lat_ts={lat0} +lon_0={lon0}",
+            if lat0 < 0.0 { -90 } else { 90 }
+        ),
+        17 => format!("+proj=eqc +lat_ts={sp1} +lat_0={lat0} +lon_0={lon0}"),
+        24 => format!("+proj=sinu +lon_0={lon0}"),
+        other => {
+            return Err(Error::RustError(format!(
+                "user-defined CRS uses ProjCoordTrans {other}, which is not implemented"
+            )))
+        }
+    };
+
+    Ok(format!(
+        "{core} +x_0={x0} +y_0={y0} {} {} +no_defs",
+        datum_clause(gk),
+        units_clause(gk)
+    ))
+}
+
+/// Prefer a named datum; fall back to the ellipsoid the geokeys describe.
+fn datum_clause(gk: &GeoKeyDirectory) -> String {
+    match gk.geog_geodetic_datum.or(gk.geographic_type) {
+        Some(4326) | Some(6326) => return "+datum=WGS84".into(),
+        Some(4269) | Some(6269) => return "+datum=NAD83".into(),
+        Some(4267) | Some(6267) => return "+datum=NAD27".into(),
+        _ => {}
+    }
+    match gk.geog_ellipsoid {
+        Some(7030) => return "+ellps=WGS84".into(),
+        Some(7019) => return "+ellps=GRS80".into(),
+        _ => {}
+    }
+    if let (Some(a), Some(rf)) = (gk.geog_semi_major_axis, gk.geog_inv_flattening) {
+        return format!("+a={a} +rf={rf}");
+    }
+    if let (Some(a), Some(b)) = (gk.geog_semi_major_axis, gk.geog_semi_minor_axis) {
+        return format!("+a={a} +b={b}");
+    }
+    // ponytail: WGS84 is right for almost everything written this way, and the
+    // alternative is refusing to serve the file at all.
+    "+datum=WGS84".into()
+}
+
+fn units_clause(gk: &GeoKeyDirectory) -> String {
+    match gk.proj_linear_units {
+        Some(9002) => "+units=ft".into(),
+        Some(9003) => "+units=us-ft".into(),
+        None | Some(9001) => "+units=m".into(),
+        // Anything else is described by its size in metres.
+        _ => match gk.proj_linear_unit_size {
+            Some(m) => format!("+to_meter={m}"),
+            None => "+units=m".into(),
+        },
     }
 }
 
@@ -31,22 +183,17 @@ pub(crate) struct Reproject {
     to: Option<proj4rs::Proj>, // None when source and target are the same
 }
 
-fn proj(code: u16) -> Result<proj4rs::Proj> {
-    proj4rs::Proj::from_epsg_code(code)
-        .map_err(|e| Error::RustError(format!("EPSG:{code} unsupported by proj4rs: {e:?}")))
-}
-
 impl Reproject {
-    pub(crate) fn between(from: u16, to: u16) -> Result<Self> {
+    pub(crate) fn between(from: &Crs, to: &Crs) -> Result<Self> {
         Ok(Self {
-            from: proj(from)?,
-            to: (from != to).then(|| proj(to)).transpose()?,
+            from: from.proj()?,
+            to: (from != to).then(|| to.proj()).transpose()?,
         })
     }
 
     /// Web Mercator into the COG's own CRS — what serving a tile needs.
-    pub(crate) fn new(code: u16) -> Result<Self> {
-        Self::between(WEB_MERCATOR, code)
+    pub(crate) fn new(to: &Crs) -> Result<Self> {
+        Self::between(&Crs::Epsg(WEB_MERCATOR), to)
     }
 
     /// `None` when the point falls outside the target projection's domain.
@@ -87,8 +234,8 @@ pub(crate) fn transform_of(ifd: &ImageFileDirectory) -> Result<Transform> {
 }
 
 /// Corner bounds in EPSG:4326, for TileJSON and for fitting the viewer's map.
-pub(crate) fn wgs84_bounds(t: &Transform, code: u16, w: u32, h: u32) -> Result<[f64; 4]> {
-    let to_wgs = Reproject::between(code, 4326)?;
+pub(crate) fn wgs84_bounds(t: &Transform, crs: &Crs, w: u32, h: u32) -> Result<[f64; 4]> {
+    let to_wgs = Reproject::between(crs, &Crs::WGS84)?;
     let (x1, y1) = (
         t.origin_x + w as f64 * t.res_x,
         t.origin_y - h as f64 * t.res_y,
