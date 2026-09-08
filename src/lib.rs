@@ -19,9 +19,13 @@ use tiles::tile;
 
 /// Output tile size. titiler defaults to 256; so do we.
 pub(crate) const TILE: usize = 256;
-/// Refuse to assemble a tile out of more source tiles than this, so a bad
-/// request can't fan out into hundreds of range reads.
-pub(crate) const MAX_SOURCE_TILES: usize = 64;
+/// Refuse to assemble a tile out of more source tiles than this. Each one is a
+/// subrequest, and Workers caps those per request (1000 paid, 50 free), so the
+/// ceiling is the platform's, not an arbitrary one. A COG whose overview
+/// pyramid stops well short of the zoom being asked for genuinely needs this
+/// many reads — the whole coarsest level is often only a couple of hundred
+/// tiles, so this is bounded, not runaway.
+pub(crate) const MAX_SOURCE_TILES: usize = 256;
 /// EPSG code of the tile grid we serve.
 pub(crate) const WEB_MERCATOR: u16 = 3857;
 /// Source tiles to sample when estimating a display range. Kept small because

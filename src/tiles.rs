@@ -126,9 +126,14 @@ pub(crate) async fn tile(
         .flat_map(|ty| (tx0..=tx1).map(move |tx| (tx, ty)))
         .collect();
     if coords.len() > MAX_SOURCE_TILES {
+        // Say which level we landed on and how coarse it is, so the message
+        // points at the pyramid rather than vaguely blaming it.
         return Err(Error::RustError(format!(
-            "tile would need {} source tiles (max {MAX_SOURCE_TILES}); the COG is probably missing overviews",
-            coords.len()
+            "tile needs {} source tiles from overview level {level} of {} (max {MAX_SOURCE_TILES}); \
+             the pyramid is {:.0}x finer than this zoom needs, so it stops too shallow",
+            coords.len(),
+            ifds.len() - 1,
+            target_res / (t.res_x * scale),
         )));
     }
 
