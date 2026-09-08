@@ -6,12 +6,11 @@ use std::sync::Arc;
 
 use async_tiff::decoder::{Decoder, DecoderRegistry};
 use async_tiff::error::{AsyncTiffError, AsyncTiffResult};
-use async_tiff::metadata::cache::ReadaheadMetadataCache;
 use async_tiff::reader::AsyncFileReader;
 use async_tiff::{ImageFileDirectory, TIFF};
 
 use crate::fail::{Fail, Out};
-use crate::lazyifd::Levels;
+use crate::lazyifd::{BlockFetch, Levels, CHAIN_BLOCK};
 use async_trait::async_trait;
 use bytes::Bytes;
 use worker::*;
@@ -180,10 +179,13 @@ pub(crate) struct Cog {
 impl Cog {
     pub(crate) async fn open(src: &str) -> Out<Self> {
         let reader = HttpReader::new(src);
-        // A COG's IFD chain sits at the front of the file, and the walk below
-        // skips the per-tile arrays, so 256 KiB covers it in one read.
-        let cache = ReadaheadMetadataCache::new(reader.clone()).with_initial_size(256 * 1024);
-        let levels = Levels::open(&cache)
+        // Read the chain in blocks, not sequentially from byte 0. A COG is
+        // *supposed* to keep its IFDs at the front, but plenty do not — NLCD's
+        // CONUS land cover puts its overview IFDs 962 MB into a 1.4 GB file,
+        // and a sequential readahead walking out to them pulls the whole
+        // gigabyte through a Worker that is capped at 128 MB.
+        let fetch = BlockFetch::with_block(reader.clone(), CHAIN_BLOCK);
+        let levels = Levels::open(&fetch)
             .await
             .map_err(|e| Fail::upstream(format!("could not read metadata: {e}")))?;
         if levels.light().is_empty() {

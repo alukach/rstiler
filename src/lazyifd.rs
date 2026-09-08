@@ -40,6 +40,7 @@ const HEAVY: [u16; 4] = [
 #[derive(Debug)]
 pub(crate) struct BlockFetch<F: MetadataFetch> {
     inner: F,
+    block: u64,
     blocks: Mutex<Vec<(Range<u64>, Bytes)>>,
 }
 
@@ -51,9 +52,17 @@ pub(crate) struct BlockFetch<F: MetadataFetch> {
 const BLOCK: u64 = 512 * 1024;
 
 impl<F: MetadataFetch> BlockFetch<F> {
+    /// Sized for reading a level's per-tile arrays.
     pub(crate) fn new(inner: F) -> Self {
+        Self::with_block(inner, BLOCK)
+    }
+
+    /// Walking the IFD chain touches entry tables and small tag values, so a
+    /// smaller block wastes less on a COG whose whole chain is a few KiB.
+    pub(crate) fn with_block(inner: F, block: u64) -> Self {
         Self {
             inner,
+            block,
             blocks: Mutex::new(Vec::new()),
         }
     }
@@ -73,8 +82,8 @@ impl<F: MetadataFetch> MetadataFetch for BlockFetch<F> {
             }
         }
 
-        let start = range.start / BLOCK * BLOCK;
-        let end = range.end.max(start + BLOCK).div_ceil(BLOCK) * BLOCK;
+        let start = range.start / self.block * self.block;
+        let end = range.end.max(start + self.block).div_ceil(self.block) * self.block;
         let bytes = self.inner.fetch(start..end).await?;
 
         let from = (range.start - start) as usize;
@@ -86,6 +95,12 @@ impl<F: MetadataFetch> MetadataFetch for BlockFetch<F> {
         Ok(slice)
     }
 }
+
+/// Block size for walking the IFD chain. Small, because the chain is entry
+/// tables and short tag values — but it must still be a *block* read rather
+/// than a sequential one: overview IFDs are not always at the front of the
+/// file. NLCD's CONUS land cover puts them 962 MB in.
+pub(crate) const CHAIN_BLOCK: u64 = 128 * 1024;
 
 /// The IFD chain, parsed without its per-tile arrays.
 pub(crate) struct Levels {

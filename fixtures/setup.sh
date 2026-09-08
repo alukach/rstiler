@@ -31,6 +31,17 @@ gdal_translate -q -b 1 -ot Int16 -scale 0 255 -2000 8000 -a_nodata -32768 _plain
 cog -co COMPRESS=DEFLATE _c.tif                 synthetic_dem_int16.tif
 gdal_translate -q -co TILED=YES -co BLOCKXSIZE=256 -co BLOCKYSIZE=256 -co COMPRESS=DEFLATE \
   _plain.tif                                    synthetic_no_overviews.tif
+
+# Overviews appended *after* the image data, so the overview IFDs sit at the
+# end of the file rather than the front. Legal TIFF, and how NLCD's CONUS land
+# cover ships — a reader that walks the chain sequentially from byte 0 pulls
+# the entire file to reach them.
+# Uncompressed so the image data is bulky and the trailing IFDs land several
+# blocks in, which is what makes a sequential reader visibly worse than a
+# block one.
+gdal_translate -q -co TILED=YES -co BLOCKXSIZE=256 -co BLOCKYSIZE=256 -co COMPRESS=NONE \
+  _plain.tif                                    layout_trailing_overviews.tif
+gdaladdo -q -r average layout_trailing_overviews.tif 2 4 8
 rm -f _src.ppm _plain.tif _a.tif _b.tif _c.tif
 
 # ---------------------------------------------------------------- corpus
