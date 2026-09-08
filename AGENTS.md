@@ -44,9 +44,20 @@ cargo fmt --check
 cargo clippy --target wasm32-unknown-unknown --release --all-features -- -D warnings
 ```
 
+The fixture harness is linted too:
+
+```
+uvx ruff check fixtures/
+shellcheck fixtures/*.sh
+```
+
 CI runs exactly these, so a green local run means a green pipeline. Clippy is
-`-D warnings` and the tree is clean — fix a lint rather than allowing it, and
-if a lint is genuinely wrong, `#[allow]` it with a comment saying why.
+`-D warnings` and both linters are clean — fix a lint rather than allowing it,
+and when a lint is genuinely wrong, `#[allow]` or `# noqa:` it with a comment
+saying why. There are three such suppressions today and each names its reason.
+
+Do not add `ruff format` or drop the `rustfmt::skip` on `BUILTIN`: the aligned
+tables in `check.py` and `colormap.rs` are aligned on purpose.
 
 `check.py` is the gate for anything touching the tile pipeline, and its
 `KNOWN_GAPS` dict is the gap list in executable form. Three rules:

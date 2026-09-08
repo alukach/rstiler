@@ -14,7 +14,12 @@ Checks tagged UNIMPLEMENTED name a titiler behaviour we do not have. They are
 reported, not failed — that list is the conformance gap, and it shrinks by
 deleting entries, never by weakening an assertion.
 """
-import json, math, os, pathlib, subprocess, sys, urllib.parse
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import urllib.parse
 
 TILER = os.environ.get("TILER", "http://127.0.0.1:8787")
 ORIGIN = os.environ.get("ORIGIN", "http://127.0.0.1:8099")
@@ -57,7 +62,9 @@ def check(name, cite):
             results.append(("ok", name, cite, ""))
         except AssertionError as e:
             results.append(("FAIL", name, cite, str(e)))
-        except Exception as e:  # a crash is a failure too
+        # A check that crashes is a failed check: one bad assertion must not
+        # abort the other twenty-two.
+        except Exception as e:  # noqa: BLE001
             results.append(("FAIL", name, cite, f"{type(e).__name__}: {e}"))
         return fn
     return wrap
@@ -69,7 +76,7 @@ def get(path):
     hdr = "/tmp/conf_head.txt"
     code = subprocess.run(
         ["curl", "-s", "--max-time", "120", "-o", out, "-D", hdr, "-w", "%{http_code}",
-         TILER + path], capture_output=True, text=True).stdout.strip()
+         TILER + path], capture_output=True, text=True, check=False).stdout.strip()
     headers = {}
     for line in pathlib.Path(hdr).read_text(errors="replace").splitlines():
         if ":" in line:

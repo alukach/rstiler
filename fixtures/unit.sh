@@ -6,7 +6,7 @@
 # modules deliberately depend on nothing, so rustc can build each as its own
 # test binary.
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 fail=0
 for m in tiling colormap query; do

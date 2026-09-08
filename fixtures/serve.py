@@ -3,7 +3,9 @@
 
     python3 fixtures/serve.py [port]     # default 8099
 """
-import http.server, os, sys
+import http.server
+import os
+import sys
 
 
 class RangeHandler(http.server.SimpleHTTPRequestHandler):

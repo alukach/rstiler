@@ -10,7 +10,15 @@ allowed to fail, with the reason recorded — that list is the gap list, in
 executable form. A file that fails without being listed is a regression; a file
 that starts passing tells you to delete its entry.
 """
-import json, math, os, pathlib, struct, subprocess, sys, urllib.parse, zlib
+import json
+import math
+import os
+import pathlib
+import struct
+import subprocess
+import sys
+import urllib.parse
+import zlib
 
 TILER = os.environ.get("TILER", "http://127.0.0.1:8787")
 ORIGIN = os.environ.get("ORIGIN", "http://127.0.0.1:8099")
@@ -42,14 +50,14 @@ def curl(path, out="/tmp/check_body.bin", timeout=120):
         path += BUST
     code = subprocess.run(
         ["curl", "-s", "--max-time", str(timeout), "-o", out, "-w", "%{http_code}",
-         TILER + path], capture_output=True, text=True).stdout.strip()
+         TILER + path], capture_output=True, text=True, check=False).stdout.strip()
     return code, pathlib.Path(out)
 
 
 def detail(p):
     try:
         return json.loads(p.read_text(errors="replace")).get("detail", "?")
-    except Exception:
+    except Exception:  # noqa: BLE001 - any unparseable body means we got nothing usable
         return "no response"
 
 
@@ -164,9 +172,11 @@ def assertions():
     R = 20037508.342789244
     s = 2 * R / (1 << Z)
     te = (-R + X * s, R - (Y + 1) * s, -R + (X + 1) * s, R - Y * s)
+    # The return code is the branch: no GDAL, no comparison, and that is fine.
     if subprocess.run(["gdalwarp", "-q", "-overwrite", "-t_srs", "EPSG:3857", "-te",
                        *map(str, te), "-ts", "256", "256", "-r", "near",
-                       str(HERE / "synthetic_rgb_3857.tif"), "/tmp/ref.tif"]).returncode == 0:
+                       str(HERE / "synthetic_rgb_3857.tif"), "/tmp/ref.tif"],
+                      check=False).returncode == 0:
         subprocess.run(["gdal_translate", "-q", "-of", "PNG", "-b", "1", "-b", "2", "-b", "3",
                         "/tmp/ref.tif", "/tmp/ref.png"], check=True)
         d = maxdiff("/tmp/m.png", "/tmp/ref.png")
@@ -176,7 +186,7 @@ def assertions():
     # 2. The same ground point must read the same through three projections.
     want = subprocess.run(["gdallocationinfo", "-wgs84", "-valonly",
                            str(HERE / "synthetic_rgb_3857.tif"), "-73.93", "40.80"],
-                          capture_output=True, text=True).stdout.split()
+                          capture_output=True, text=True, check=False).stdout.split()
     for v in ("3857", "4326", "32618"):
         _, body = curl(f"/cog/point/-73.93,40.80?url={url_for(f'synthetic_rgb_{v}.tif')}")
         got = [str(int(x)) for x in json.loads(body.read_text())["values"]]

@@ -34,6 +34,19 @@ jobs:
         # Warnings are failures here; the tree is clean and should stay that way.
         run: cargo clippy --target $TARGET --release --all-features -- -D warnings
 
+  scripts:
+    name: ruff + shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The fixture harness is Python and shell, and it is what every other
+      # job's verdict rests on — lint it like the Rust.
+      - uses: astral-sh/ruff-action@v4.1.0
+        with:
+          args: check fixtures/
+      - name: shellcheck
+        run: shellcheck fixtures/*.sh
+
   unit:
     name: unit tests
     runs-on: ubuntu-latest
@@ -120,7 +133,7 @@ jobs:
 
   deploy:
     name: deploy
-    needs: [lint, unit, build, integration, audit]
+    needs: [lint, scripts, unit, build, integration, audit]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:

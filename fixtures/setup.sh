@@ -67,5 +67,7 @@ if [ "${1:-}" = "--all" ]; then
   cp "$D/nlcd/nlcd_landcover.tif"                         real_nlcd_landcover.tif
 fi
 
-ls -lh ./*.tif | awk '{printf "  %-30s %s\n", $9, $5}'
-echo "  $(ls ./*.tif | wc -l | tr -d ' ') files"
+for f in ./*.tif; do
+  printf '  %-30s %s\n' "${f#./}" "$(du -h "$f" | cut -f1)"
+done
+printf '  %s files\n' "$(find . -maxdepth 1 -name '*.tif' | wc -l | tr -d ' ')"

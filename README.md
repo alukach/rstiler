@@ -290,6 +290,7 @@ pushing.
 | Job | What it guards |
 |---|---|
 | `lint` | `cargo fmt --check`, and `clippy -D warnings` against wasm32 |
+| `scripts` | `ruff check` and `shellcheck` over `fixtures/` |
 | `unit` | the dependency-free modules, via `fixtures/unit.sh` |
 | `build` | the wasm build, and reports bundle size to the run summary |
 | `integration` | `fixtures/check.py` and `fixtures/conformance.py` against a real `wrangler dev`, with GDAL installed as the reference |
@@ -298,6 +299,11 @@ pushing.
 
 Everything is checked against `wasm32-unknown-unknown`, since that is the only
 target this ships to — linting a native build would check code we never run.
+
+`ruff check` runs, `ruff format` does not: the formatter would break up the
+tabulated `KNOWN_GAPS` dict and explode the curl argument lists one flag per
+line. Same reason `BUILTIN` in `src/colormap.rs` is `#[rustfmt::skip]` — those
+tables are aligned because alignment is what makes them readable.
 
 Deploying is opt-in: a fork without the secret runs every check and stops
 before the deploy rather than failing on a missing token.
