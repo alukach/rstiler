@@ -10,6 +10,7 @@ use async_tiff::metadata::cache::ReadaheadMetadataCache;
 use async_tiff::reader::AsyncFileReader;
 use async_tiff::{ImageFileDirectory, TIFF};
 
+use crate::fail::{Fail, Out};
 use crate::lazyifd::Levels;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -54,6 +55,10 @@ impl HttpReader {
     }
 }
 
+/// Prefix that carries an origin status out through async-tiff's error type,
+/// so the router can map it to a status of its own. See `fail::upstream`.
+pub(crate) const HTTP_STATUS_MARKER: &str = "upstream HTTP ";
+
 fn tiff_err<E: std::fmt::Debug>(e: E) -> AsyncTiffError {
     AsyncTiffError::General(format!("{e:?}"))
 }
@@ -90,7 +95,7 @@ impl AsyncFileReader for HttpReader {
         let mut resp = Fetch::Request(req).send().await.map_err(tiff_err)?;
         if resp.status_code() != 206 && resp.status_code() != 200 {
             return Err(AsyncTiffError::General(format!(
-                "upstream returned {} for {}",
+                "{HTTP_STATUS_MARKER}{} for {}",
                 resp.status_code(),
                 self.url
             )));
@@ -173,16 +178,16 @@ pub(crate) struct Cog {
 }
 
 impl Cog {
-    pub(crate) async fn open(src: &str) -> Result<Self> {
+    pub(crate) async fn open(src: &str) -> Out<Self> {
         let reader = HttpReader::new(src);
         // A COG's IFD chain sits at the front of the file, and the walk below
         // skips the per-tile arrays, so 256 KiB covers it in one read.
         let cache = ReadaheadMetadataCache::new(reader.clone()).with_initial_size(256 * 1024);
         let levels = Levels::open(&cache)
             .await
-            .map_err(|e| Error::RustError(format!("could not read metadata: {e}")))?;
+            .map_err(|e| Fail::upstream(format!("could not read metadata: {e}")))?;
         if levels.light().is_empty() {
-            return Err(Error::RustError("no image IFDs in this TIFF".into()));
+            return Err(Fail::bad("no image IFDs in this TIFF"));
         }
         Ok(Self { reader, levels })
     }
@@ -193,11 +198,11 @@ impl Cog {
     }
 
     /// Read one level with its per-tile arrays, so its pixels can be fetched.
-    pub(crate) async fn full(&self, level: usize) -> Result<TIFF> {
+    pub(crate) async fn full(&self, level: usize) -> Out<TIFF> {
         self.levels
             .full(&self.reader, level)
             .await
-            .map_err(|e| Error::RustError(format!("could not read level {level}: {e}")))
+            .map_err(|e| Fail::upstream(format!("could not read level {level}: {e}")))
     }
 
     /// Index of the coarsest level, which is where sampling for statistics

@@ -3,7 +3,7 @@
 
 use async_tiff::geo::GeoKeyDirectory;
 use async_tiff::ImageFileDirectory;
-use worker::*;
+use crate::fail::{Fail, Out};
 
 use crate::tiling::Transform;
 use crate::WEB_MERCATOR;
@@ -28,21 +28,21 @@ impl Crs {
         }
     }
 
-    fn proj(&self) -> Result<proj4rs::Proj> {
+    fn proj(&self) -> Out<proj4rs::Proj> {
         match self {
             Crs::Epsg(c) => proj4rs::Proj::from_epsg_code(*c)
-                .map_err(|e| Error::RustError(format!("EPSG:{c} unsupported by proj4rs: {e:?}"))),
+                .map_err(|e| Fail::bad(format!("EPSG:{c} unsupported by proj4rs: {e:?}"))),
             Crs::Proj(s) => proj4rs::Proj::from_proj_string(s)
-                .map_err(|e| Error::RustError(format!("proj4rs rejected {s:?}: {e:?}"))),
+                .map_err(|e| Fail::bad(format!("proj4rs rejected {s:?}: {e:?}"))),
         }
     }
 }
 
 /// Look up the COG's CRS from its GeoKeyDirectory.
-pub(crate) fn source_crs(ifd: &ImageFileDirectory) -> Result<Crs> {
+pub(crate) fn source_crs(ifd: &ImageFileDirectory) -> Out<Crs> {
     let gk = ifd
         .geo_key_directory()
-        .ok_or_else(|| Error::RustError("no GeoKeyDirectory: not a GeoTIFF".into()))?;
+        .ok_or_else(|| Fail::bad("no GeoKeyDirectory: not a GeoTIFF"))?;
     match gk.projected_type.or(gk.geographic_type) {
         Some(32767) | None => Ok(Crs::Proj(proj_string_from_geokeys(gk)?)),
         Some(code) => Ok(Crs::Epsg(code)),
@@ -55,7 +55,7 @@ pub(crate) fn source_crs(ifd: &ImageFileDirectory) -> Result<Crs> {
 /// method and a scatter of parameter geokeys. The parameters come in "natural
 /// origin", "false origin" and "center" spellings depending on the method and
 /// the writer, so each is looked up in turn.
-fn proj_string_from_geokeys(gk: &GeoKeyDirectory) -> Result<String> {
+fn proj_string_from_geokeys(gk: &GeoKeyDirectory) -> Out<String> {
     // A CRS can also name a *coded* projection instead of spelling out a
     // method. 160xx / 161xx are the UTM zones, which is nearly all of them.
     if gk.proj_coord_trans.is_none() {
@@ -64,7 +64,7 @@ fn proj_string_from_geokeys(gk: &GeoKeyDirectory) -> Result<String> {
                 16001..=16060 => (code - 16000, "+north"),
                 16101..=16160 => (code - 16100, "+south"),
                 other => {
-                    return Err(Error::RustError(format!(
+                    return Err(Fail::bad(format!(
                         "user-defined CRS names ProjectionGeoKey {other}, which is not implemented"
                     )))
                 }
@@ -78,9 +78,7 @@ fn proj_string_from_geokeys(gk: &GeoKeyDirectory) -> Result<String> {
     }
 
     let method = gk.proj_coord_trans.ok_or_else(|| {
-        Error::RustError(
-            "user-defined CRS with neither ProjCoordTransGeoKey nor ProjectionGeoKey".into(),
-        )
+        Fail::bad("user-defined CRS with neither ProjCoordTransGeoKey nor ProjectionGeoKey")
     })?;
 
     let lat0 = gk
@@ -127,7 +125,7 @@ fn proj_string_from_geokeys(gk: &GeoKeyDirectory) -> Result<String> {
         17 => format!("+proj=eqc +lat_ts={sp1} +lat_0={lat0} +lon_0={lon0}"),
         24 => format!("+proj=sinu +lon_0={lon0}"),
         other => {
-            return Err(Error::RustError(format!(
+            return Err(Fail::bad(format!(
                 "user-defined CRS uses ProjCoordTrans {other}, which is not implemented"
             )))
         }
@@ -184,7 +182,7 @@ pub(crate) struct Reproject {
 }
 
 impl Reproject {
-    pub(crate) fn between(from: &Crs, to: &Crs) -> Result<Self> {
+    pub(crate) fn between(from: &Crs, to: &Crs) -> Out<Self> {
         Ok(Self {
             from: from.proj()?,
             to: (from != to).then(|| to.proj()).transpose()?,
@@ -192,7 +190,7 @@ impl Reproject {
     }
 
     /// Web Mercator into the COG's own CRS — what serving a tile needs.
-    pub(crate) fn new(to: &Crs) -> Result<Self> {
+    pub(crate) fn new(to: &Crs) -> Out<Self> {
         Self::between(&Crs::Epsg(WEB_MERCATOR), to)
     }
 
@@ -218,13 +216,13 @@ impl Reproject {
     }
 }
 
-pub(crate) fn transform_of(ifd: &ImageFileDirectory) -> Result<Transform> {
+pub(crate) fn transform_of(ifd: &ImageFileDirectory) -> Out<Transform> {
     let scale = ifd
         .model_pixel_scale()
-        .ok_or_else(|| Error::RustError("no ModelPixelScale: not a north-up GeoTIFF".into()))?;
+        .ok_or_else(|| Fail::bad("no ModelPixelScale: not a north-up GeoTIFF"))?;
     let tp = ifd
         .model_tiepoint()
-        .ok_or_else(|| Error::RustError("no ModelTiepoint: not a north-up GeoTIFF".into()))?;
+        .ok_or_else(|| Fail::bad("no ModelTiepoint: not a north-up GeoTIFF"))?;
     Ok(Transform {
         origin_x: tp[3] - tp[0] * scale[0],
         origin_y: tp[4] + tp[1] * scale[1],
@@ -234,7 +232,7 @@ pub(crate) fn transform_of(ifd: &ImageFileDirectory) -> Result<Transform> {
 }
 
 /// Corner bounds in EPSG:4326, for TileJSON and for fitting the viewer's map.
-pub(crate) fn wgs84_bounds(t: &Transform, crs: &Crs, w: u32, h: u32) -> Result<[f64; 4]> {
+pub(crate) fn wgs84_bounds(t: &Transform, crs: &Crs, w: u32, h: u32) -> Out<[f64; 4]> {
     let to_wgs = Reproject::between(crs, &Crs::WGS84)?;
     let (x1, y1) = (
         t.origin_x + w as f64 * t.res_x,

@@ -37,9 +37,11 @@ only when asked.
 ./fixtures/setup.sh --all          # once; GDAL + ~7 MB of corpus
 python3 fixtures/serve.py &        # :8099
 wrangler dev &                     # :8787
-python3 fixtures/check.py
+python3 fixtures/check.py                  # formats and rendering
+python3 fixtures/conformance.py            # titiler's contract
 rustc --test src/tiling.rs   -o /tmp/t && /tmp/t
 rustc --test src/colormap.rs -o /tmp/c && /tmp/c
+rustc --test src/query.rs    -o /tmp/q && /tmp/q
 ```
 
 `check.py` is the gate for anything touching the tile pipeline, and its
@@ -53,6 +55,12 @@ rustc --test src/colormap.rs -o /tmp/c && /tmp/c
   the parity table from outrunning what actually works.
 - A fixture that renders a blank tile fails. If it is *legitimately* empty, put
   it in `ALL_NODATA` with the evidence — not in `KNOWN_GAPS`.
+
+`conformance.py` is the other gate: it encodes titiler's contract, and every
+assertion cites the titiler test it came from. When you add a parameter or an
+endpoint, copy titiler's spelling and its status codes rather than inventing
+your own, and add the matching check. Its `UNIMPLEMENTED` dict shrinks by
+deleting entries — never by softening an assertion so it passes.
 
 Timing claims come from the `Server-Timing` header on a real remote COG, not
 from a fixture on localhost.

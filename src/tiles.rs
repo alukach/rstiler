@@ -7,6 +7,8 @@ use async_tiff::TypedArray;
 use worker::*;
 
 use crate::cog::{decoders, nodata_of, Cog};
+use crate::fail::{Fail, Out};
+use crate::query::Query;
 use crate::geo::{transform_of, source_crs, Reproject};
 use crate::render::{band_indices, colormap, png_response, rescale, resampling, sample};
 use crate::tiling::{pick_overview, tile_bounds};
@@ -17,12 +19,12 @@ pub(crate) async fn tile(
     z: &str,
     x: &str,
     y: &str,
-    q: &HashMap<String, String>,
-) -> Result<Response> {
-    let parse = |s: &str, what: &str| -> Result<u32> {
+    q: &Query,
+) -> Out<Response> {
+    let parse = |s: &str, what: &str| -> Out<u32> {
         s.trim_end_matches(".png")
             .parse()
-            .map_err(|_| Error::RustError(format!("bad {what}")))
+            .map_err(|_| Fail::bad(format!("{what} is not a number: {s:?}")))
     };
     let (z, x, y) = (parse(z, "z")?, parse(x, "x")?, parse(y, "y")?);
 
@@ -37,7 +39,7 @@ pub(crate) async fn tile(
     if base.planar_configuration() != PlanarConfiguration::Chunky {
         // ponytail: planar TIFFs are rare in the wild; add band-plane
         // reassembly here if one shows up.
-        return Err(Error::RustError("planar TIFFs not supported".into()));
+        return Err(Fail::bad("planar TIFFs not supported"));
     }
 
     let (xmin, ymin, xmax, ymax) = tile_bounds(z, x, y);
@@ -90,15 +92,20 @@ pub(crate) async fn tile(
 
     let colormap = colormap(q)?;
     let bands = band_indices(q, ifd.samples_per_pixel() as usize)?;
+    // A PNG is grey or RGB, so a tile can only be drawn from 1 or 3 bands.
+    if !matches!(bands.len(), 1 | 3) {
+        return Err(Fail::bad(format!(
+            "bidx names {} bands; a tile needs 1 or 3",
+            bands.len()
+        )));
+    }
     if colormap.is_some() && bands.len() != 1 {
-        return Err(Error::RustError(
-            "a colormap needs exactly one band; pass bidx=<n>".into(),
-        ));
+        return Err(Fail::bad("a colormap needs exactly one band; pass bidx=<n>"));
     }
     let (lo, hi) = rescale(q, bands.len())?;
     let how = resampling(q)?;
     // titiler lets a request override the dataset's own nodata.
-    let nodata = match q.get("nodata").filter(|s| !s.is_empty()) {
+    let nodata = match q.last("nodata") {
         Some(s) => Some(
             s.trim()
                 .parse::<f64>()
@@ -116,7 +123,7 @@ pub(crate) async fn tile(
 
     let tw = ifd
         .tile_width()
-        .ok_or_else(|| Error::RustError("not a tiled TIFF (stripped COGs unsupported)".into()))?
+        .ok_or_else(|| Fail::bad("not a tiled TIFF (stripped COGs unsupported)"))?
         as usize;
     let th = ifd.tile_height().unwrap() as usize;
     let (ntx, nty) = ifd.tile_count().unwrap();
@@ -131,7 +138,7 @@ pub(crate) async fn tile(
     if coords.len() > MAX_SOURCE_TILES {
         // Say which level we landed on and how coarse it is, so the message
         // points at the pyramid rather than vaguely blaming it.
-        return Err(Error::RustError(format!(
+        return Err(Fail::bad(format!(
             "tile needs {} source tiles from overview level {level} of {} (max {MAX_SOURCE_TILES}); \
              the pyramid is {:.0}x finer than this zoom needs, so it stops too shallow",
             coords.len(),
@@ -144,7 +151,7 @@ pub(crate) async fn tile(
     let fetched = ifd
         .fetch_tiles(&coords, &cog.reader)
         .await
-        .map_err(|e| Error::RustError(format!("tile fetch failed: {e}")))?;
+        .map_err(|e| Fail::upstream(format!("tile fetch failed: {e}")))?;
     let t_fetch = Date::now().as_millis() - t1;
     let t2 = Date::now().as_millis();
 
@@ -153,7 +160,7 @@ pub(crate) async fn tile(
         let (cx, cy) = (tile.x(), tile.y());
         let arr = tile
             .decode(&decoders())
-            .map_err(|e| Error::RustError(format!("decode failed: {e}")))?;
+            .map_err(|e| Fail::bad(format!("decode failed: {e}")))?;
         let nb = arr.shape()[2];
         chunks.insert((cx, cy), (arr.into_inner().0, nb));
     }
@@ -225,6 +232,6 @@ pub(crate) async fn tile(
         bytes / 1024
     );
     let mut resp = png_response(&rgba)?;
-    resp.headers_mut().set("Server-Timing", &timing)?;
+    let _ = resp.headers_mut().set("Server-Timing", &timing);
     Ok(resp)
 }

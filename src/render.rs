@@ -1,11 +1,14 @@
 //! Turning decoded samples into an 8-bit RGBA PNG.
 
-use std::collections::HashMap;
 
 use async_tiff::TypedArray;
 use worker::*;
 
+use std::collections::HashMap;
+
 use crate::colormap::{Colormap, BUILTIN};
+use crate::fail::{Fail, Out};
+use crate::query::Query;
 use crate::TILE;
 
 pub(crate) fn sample(data: &TypedArray, i: usize) -> f64 {
@@ -25,30 +28,21 @@ pub(crate) fn sample(data: &TypedArray, i: usize) -> f64 {
 }
 
 /// Reads titiler's two spellings. Returns `None` when neither is given.
-pub(crate) fn colormap(q: &HashMap<String, String>) -> Result<Option<Colormap>> {
-    if let Some(json) = q.get("colormap").filter(|s| !s.is_empty()) {
-        let raw: HashMap<String, Vec<u8>> = serde_json::from_str(json)
-            .map_err(|e| Error::RustError(format!("colormap is not valid JSON: {e}")))?;
+pub(crate) fn colormap(q: &Query) -> Out<Option<Colormap>> {
+    if let Some(json) = q.last("colormap") {
+        let raw: HashMap<String, serde_json::Value> = serde_json::from_str(json)
+            .map_err(|e| Fail::bad(format!("colormap is not valid JSON: {e}")))?;
         let mut table = HashMap::with_capacity(raw.len());
         for (k, v) in raw {
-            let key = k.parse::<i64>().map_err(|_| {
-                Error::RustError(format!("colormap key {k:?} is not an integer"))
-            })?;
-            let rgba = match v.len() {
-                3 => [v[0], v[1], v[2], 255],
-                4 => [v[0], v[1], v[2], v[3]],
-                n => {
-                    return Err(Error::RustError(format!(
-                        "colormap entry {k} has {n} channels, expected 3 or 4"
-                    )))
-                }
-            };
-            table.insert(key, rgba);
+            let key = k
+                .parse::<i64>()
+                .map_err(|_| Fail::bad(format!("colormap key {k:?} is not an integer")))?;
+            table.insert(key, parse_colour(&v).map_err(|e| Fail::bad(format!("colormap entry {k}: {e}")))?);
         }
         return Ok(Some(Colormap::Discrete(table)));
     }
 
-    let Some(name) = q.get("colormap_name").filter(|s| !s.is_empty()) else {
+    let Some(name) = q.last("colormap_name") else {
         return Ok(None);
     };
     BUILTIN
@@ -57,11 +51,44 @@ pub(crate) fn colormap(q: &HashMap<String, String>) -> Result<Option<Colormap>> 
         .map(|(_, stops)| Some(Colormap::Continuous(stops)))
         .ok_or_else(|| {
             let known: Vec<&str> = BUILTIN.iter().map(|(n, _)| *n).collect();
-            Error::RustError(format!(
+            Fail::bad(format!(
                 "unknown colormap_name {name:?}; available: {}",
                 known.join(", ")
             ))
         })
+}
+
+/// titiler accepts a colour as `[r,g,b]`, `[r,g,b,a]`, `"#rrggbb"` or
+/// `"#rrggbbaa"`. Alpha defaults to opaque.
+fn parse_colour(v: &serde_json::Value) -> std::result::Result<[u8; 4], String> {
+    if let Some(hex) = v.as_str() {
+        let h = hex.strip_prefix('#').unwrap_or(hex);
+        if h.len() != 6 && h.len() != 8 {
+            return Err(format!("{hex:?} is not #rrggbb or #rrggbbaa"));
+        }
+        let byte = |i: usize| {
+            u8::from_str_radix(&h[i..i + 2], 16).map_err(|_| format!("{hex:?} is not hex"))
+        };
+        return Ok([
+            byte(0)?,
+            byte(2)?,
+            byte(4)?,
+            if h.len() == 8 { byte(6)? } else { 255 },
+        ]);
+    }
+    let arr = v.as_array().ok_or("expected [r,g,b], [r,g,b,a] or \"#rrggbb\"")?;
+    let chan = |i: usize| -> std::result::Result<u8, String> {
+        arr[i]
+            .as_u64()
+            .filter(|n| *n <= 255)
+            .map(|n| n as u8)
+            .ok_or_else(|| format!("channel {i} is not 0-255"))
+    };
+    match arr.len() {
+        3 => Ok([chan(0)?, chan(1)?, chan(2)?, 255]),
+        4 => Ok([chan(0)?, chan(1)?, chan(2)?, chan(3)?]),
+        n => Err(format!("{n} channels, expected 3 or 4")),
+    }
 }
 
 /// How a source pixel is picked for an output pixel.
@@ -103,69 +130,76 @@ impl Resampling {
 }
 
 /// `resampling=nearest|bilinear`, defaulting to nearest as titiler does.
-pub(crate) fn resampling(q: &HashMap<String, String>) -> Result<Resampling> {
-    match q.get("resampling").filter(|s| !s.is_empty()).map(|s| s.as_str()) {
+pub(crate) fn resampling(q: &Query) -> Out<Resampling> {
+    match q.last("resampling") {
         None | Some("nearest") => Ok(Resampling::Nearest),
         Some("bilinear") => Ok(Resampling::Bilinear),
-        Some(other) => Err(Error::RustError(format!(
+        Some(other) => Err(Fail::bad(format!(
             "resampling {other:?} not supported; use nearest or bilinear"
         ))),
     }
 }
 
 /// `bidx` is 1-based, like titiler. Defaults to RGB, else the first band.
-pub(crate) fn band_indices(q: &HashMap<String, String>, n: usize) -> Result<Vec<usize>> {
-    let idx: Vec<usize> = match q.get("bidx").filter(|s| !s.is_empty()) {
-        Some(s) => s
-            .split(',')
-            .map(|p| {
-                p.trim()
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|v| (1..=n).contains(v))
-                    .map(|v| v - 1)
-                    .ok_or_else(|| Error::RustError(format!("bidx {p} out of range 1..={n}")))
-            })
-            .collect::<Result<_>>()?,
-        None if n >= 3 => vec![0, 1, 2],
-        None => vec![0],
-    };
-    match idx.len() {
-        1 | 3 => Ok(idx),
-        _ => Err(Error::RustError("bidx must name 1 or 3 bands".into())),
+pub(crate) fn band_indices(q: &Query, n: usize) -> Out<Vec<usize>> {
+    let given = q.all("bidx");
+    if given.is_empty() {
+        // titiler's default: RGB when there are three or more bands.
+        return Ok(if n >= 3 { vec![0, 1, 2] } else { vec![0] });
     }
+    // Repeats are meaningful — titiler's own test asks for b1 three times to
+    // render a single band as grey RGB.
+    // Any number is valid here — /cog/point reports one value per entry.
+    // Rendering a *tile* needs 1 or 3, which the tile handler enforces.
+    given
+        .iter()
+        .map(|p| {
+            p.parse::<usize>()
+                .ok()
+                .filter(|v| (1..=n).contains(v))
+                .map(|v| v - 1)
+                .ok_or_else(|| Fail::bad(format!("bidx {p} out of range 1..={n}")))
+        })
+        .collect()
 }
 
 /// `rescale=min,max` applies to every band; repeat it per band to differ.
-pub(crate) fn rescale(q: &HashMap<String, String>, bands: usize) -> Result<(Vec<f64>, Vec<f64>)> {
-    let Some(s) = q.get("rescale").filter(|s| !s.is_empty()) else {
+pub(crate) fn rescale(q: &Query, bands: usize) -> Out<(Vec<f64>, Vec<f64>)> {
+    // titiler repeats the parameter for per-band ranges; `;` does the same here.
+    let given: Vec<&str> = q
+        .whole("rescale")
+        .iter()
+        .flat_map(|v| v.split(';'))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .collect();
+    if given.is_empty() {
         return Ok((vec![0.0; bands], vec![255.0; bands]));
-    };
-    let pairs: Vec<&str> = s.split(';').collect();
-    if pairs.len() != 1 && pairs.len() != bands {
-        return Err(Error::RustError(format!(
-            "rescale needs 1 or {bands} `min,max` pairs separated by `;`"
+    }
+    if given.len() != 1 && given.len() != bands {
+        return Err(Fail::bad(format!(
+            "rescale needs 1 or {bands} `min,max` pairs"
         )));
     }
     let (mut lo, mut hi) = (Vec::new(), Vec::new());
-    for p in &pairs {
+    for p in &given {
         let v: Vec<f64> = p.split(',').filter_map(|n| n.trim().parse().ok()).collect();
         match v.as_slice() {
             [a, b] if b > a => {
                 lo.push(*a);
                 hi.push(*b);
             }
-            _ => return Err(Error::RustError("rescale must be min,max with max > min".into())),
+            _ => return Err(Fail::bad(format!("rescale {p:?} must be min,max with max > min"))),
         }
     }
-    if pairs.len() == 1 {
+    if given.len() == 1 {
         lo = vec![lo[0]; bands];
         hi = vec![hi[0]; bands];
     }
     Ok((lo, hi))
 }
 
-pub(crate) fn png_response(rgba: &[u8]) -> Result<Response> {
+pub(crate) fn png_response(rgba: &[u8]) -> Out<Response> {
     let mut buf = Vec::new();
     {
         let mut enc = png::Encoder::new(&mut buf, TILE as u32, TILE as u32);
@@ -173,9 +207,9 @@ pub(crate) fn png_response(rgba: &[u8]) -> Result<Response> {
         enc.set_depth(png::BitDepth::Eight);
         let mut w = enc
             .write_header()
-            .map_err(|e| Error::RustError(format!("png: {e}")))?;
+            .map_err(|e| Fail::from(Error::RustError(format!("png: {e}"))))?;
         w.write_image_data(rgba)
-            .map_err(|e| Error::RustError(format!("png: {e}")))?;
+            .map_err(|e| Fail::from(Error::RustError(format!("png: {e}"))))?;
     }
     let mut resp = Response::from_bytes(buf)?;
     resp.headers_mut().set("Content-Type", "image/png")?;

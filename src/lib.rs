@@ -4,16 +4,19 @@
 
 mod cog;
 mod colormap;
+mod fail;
 mod geo;
 mod lazyifd;
+mod query;
 mod meta;
 mod render;
 mod tiles;
 mod tiling;
 
-use std::collections::HashMap;
-
 use worker::*;
+
+use fail::{Fail, Out};
+use query::Query;
 
 use meta::{info, point, statistics, tilejson};
 use tiles::tile;
@@ -37,7 +40,7 @@ pub(crate) const STATS_TILES: usize = 8;
 async fn fetch(req: Request, _env: Env, _ctx: Context) -> Result<Response> {
     let url = req.url()?;
     let path = url.path().trim_matches('/').to_string();
-    let q: HashMap<String, String> = url.query_pairs().into_owned().collect();
+    let q = Query::new(url.query_pairs().into_owned());
 
     // `/cog/viewer` is where titiler puts its viewer too. `/` forwards there,
     // keeping the query so a shared `?url=...` link still lands on its COG.
@@ -50,22 +53,17 @@ async fn fetch(req: Request, _env: Env, _ctx: Context) -> Result<Response> {
         return Response::from_html(include_str!("viewer.html"));
     }
 
-    let Some(src) = q.get("url").cloned() else {
-        return Response::error("missing required `url` query parameter", 400);
-    };
-
     let parts: Vec<&str> = path.split('/').collect();
 
     // A rendered tile is a pure function of its URL, and rendering one costs a
-    // metadata parse even when every source byte is already cached — a COG with
-    // a deep pyramid carries megabytes of tile offsets. Cache the PNG itself so
-    // a second viewer of the same tile pays neither.
-    let is_tile = matches!(parts.as_slice(), ["cog", "tiles", ..]);
-    let cache = Cache::default();
+    // metadata parse even when every source byte is already cached. Cache the
+    // PNG itself so a second viewer of the same tile pays neither.
     // Keyed by version so a release that changes rendering does not serve
     // tiles drawn by the previous one.
     // ponytail: bump the crate version when you change how pixels are made, or
     // pass a cache-buster (fixtures/check.py does) while iterating locally.
+    let is_tile = matches!(parts.as_slice(), ["cog", "tiles", ..]);
+    let cache = Cache::default();
     let key = format!("{url}#v{}", env!("CARGO_PKG_VERSION"));
     if is_tile {
         if let Ok(Some(hit)) = cache.get(&key, true).await {
@@ -73,14 +71,7 @@ async fn fetch(req: Request, _env: Env, _ctx: Context) -> Result<Response> {
         }
     }
 
-    let out = match parts.as_slice() {
-        ["cog", "info"] => info(&src).await,
-        ["cog", "tilejson.json"] => tilejson(&src, &url).await,
-        ["cog", "tiles", z, x, y] => tile(&src, z, x, y, &q).await,
-        ["cog", "point", coords] => point(&src, coords).await,
-        ["cog", "statistics"] => statistics(&src).await,
-        _ => return Response::error("not found", 404),
-    };
+    let out = route(&parts, &url, &q).await;
 
     match out {
         Ok(mut resp) => {
@@ -91,8 +82,27 @@ async fn fetch(req: Request, _env: Env, _ctx: Context) -> Result<Response> {
             }
             Ok(resp)
         }
-        // JSON, so the viewer can show the message rather than a bare status.
-        Err(e) => Response::from_json(&serde_json::json!({ "detail": format!("{e}") }))
-            .map(|r| r.with_status(500)),
+        // JSON with the detail, so the viewer can show what went wrong. The
+        // status is the part clients branch on.
+        Err(f) => Response::from_json(&serde_json::json!({ "detail": f.detail }))
+            .map(|r| r.with_status(f.status)),
+    }
+}
+
+async fn route(parts: &[&str], url: &Url, q: &Query) -> Out<Response> {
+    // Every route needs a source, and titiler treats a missing required query
+    // parameter as a client error.
+    let src = q
+        .last("url")
+        .ok_or_else(|| Fail::bad("missing required `url` query parameter"))?
+        .to_string();
+
+    match parts {
+        ["cog", "info"] => info(&src, q).await,
+        ["cog", "tilejson.json"] => tilejson(&src, url, q).await,
+        ["cog", "tiles", z, x, y] => tile(&src, z, x, y, q).await,
+        ["cog", "point", coords] => point(&src, coords, q).await,
+        ["cog", "statistics"] => statistics(&src, q).await,
+        _ => Err(Fail::not_found(format!("no route for /{}", parts.join("/")))),
     }
 }

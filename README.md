@@ -63,7 +63,7 @@ architecture comparison and the measurements behind it, lives at
 | `/cog/tilejson.json` | yes | yes | zoom range derived from the overview chain |
 | `/cog/info` | yes | extended | adds per-band 2nd/98th percentiles |
 | `/cog/viewer` | yes | yes | MapLibre, with the source.coop example list |
-| `/cog/statistics` | yes | partial | sampled from one overview level, not a full pass |
+| `/cog/statistics` | yes | partial | sampled from one overview level, not a full pass; no histogram |
 | `/cog/point/{lon},{lat}` | yes | yes | WGS84 only; no `coord_crs` |
 | `/cog/preview` | yes | no | |
 | `/cog/bbox/…` | yes | no | |
@@ -80,12 +80,12 @@ the STAC surface, and the OpenAPI schema FastAPI generates for free.
 | Parameter | here | Behaviour |
 |---|---|---|
 | `url` | yes | identical to titiler |
-| `bidx` | yes | 1-based, comma separated; 1 or 3 bands |
-| `rescale` | yes | `min,max`, or one pair per band separated by `;` |
+| `bidx` | yes | 1-based; repeated (`bidx=1&bidx=2`) or comma-separated. Repeats are kept, as titiler does |
+| `rescale` | yes | `min,max`; repeated or `;`-separated for per-band ranges |
 | `nodata` | yes | overrides the dataset's `GDAL_NODATA` |
 | `resampling` | partial | `nearest` (default) and `bilinear`; no cubic/lanczos/average |
 | `colormap_name` | partial | `viridis`, `magma`, `plasma`, `inferno`, `cividis`, `terrain`, `greys` |
-| `colormap` | partial | discrete `{"value":[r,g,b,a]}` for categorical data; no interval form |
+| `colormap` | partial | discrete `{"value": [r,g,b] \| [r,g,b,a] \| "#rrggbb" \| "#rrggbbaa"}`; no interval form |
 | `expression` | no | no band math |
 | `color_formula` | no | |
 | `unscale` | no | internal scale/offset ignored |
@@ -106,6 +106,33 @@ Equirectangular and Sinusoidal, plus UTM named through `ProjectionGeoKey`.
 
 Still unsupported: a rotated or sheared raster, which carries a
 `ModelTransformation` instead of `ModelPixelScale` + `ModelTiepoint`.
+
+### Conformance
+
+`fixtures/conformance.py` encodes titiler's own contract — every assertion cites
+the test in `titiler/src/titiler/core/tests/test_factories.py` it came from — so
+a client written against titiler behaves the same way here for the subset we
+implement. **23 of 23 pass.**
+
+It found real incompatibilities, not cosmetic ones:
+
+- `bidx` is a *repeated* parameter in titiler (`bidx=1&bidx=2&bidx=3`), and
+  repeats are meaningful — titiler's own test asks for `b1` three times to draw
+  one band as grey RGB. Reading the query into a `HashMap` had been silently
+  keeping only the last value.
+- Every failure was a 500. titiler distinguishes a bad request (400) from a
+  missing dataset (404) from a broken upstream, and clients branch on that.
+- `colormap` accepts `"#rrggbb"`, `"#rrggbbaa"` and 3-element RGB, not just
+  4-element RGBA.
+- `/cog/info` and `/cog/statistics` now use `rio_tiler.models` field names
+  (`band_metadata`, `band_descriptions`, `dtype`, `nodata_type`; `sum`, `std`,
+  `median`, `valid_percent`, `masked_pixels`, `valid_pixels`, `description`).
+
+The suite also lists what is not implemented — `expression`, output formats
+other than PNG, `coord_crs`/`dst_crs`, `tileMatrixSetId` in the path,
+`info.geojson`, `preview`/`bbox`/`feature`, colormap intervals, `algorithm`,
+and `histogram`/`majority`/`minority`/`unique` in statistics. That list is the
+conformance gap, and it shrinks by deleting entries, never by weakening a check.
 
 ### What has been verified
 
@@ -227,6 +254,8 @@ datum grid shifts, which is far below one pixel.
 | `src/tiles.rs` | the tile handler: the resampling pipeline |
 | `src/meta.rs` | `/cog/info` and `/cog/tilejson.json` |
 | `src/render.rs` | query parameters, resampling, samples → 8-bit RGBA → PNG |
+| `src/query.rs` | repeated query parameters, titiler's spelling |
+| `src/fail.rs` | failures that carry the status code to report |
 | `src/colormap.rs` | the colour tables (dependency-free, so it self-tests) |
 | `src/viewer.html` | the example viewer |
 
@@ -279,6 +308,8 @@ A blank tile fails too, unless the fixture is listed in `ALL_NODATA` —
 The pure-logic modules self-test without a wasm toolchain:
 
 ```
+python3 fixtures/conformance.py            # titiler's contract, 23 checks
 rustc --test src/tiling.rs   -o /tmp/t && /tmp/t
 rustc --test src/colormap.rs -o /tmp/c && /tmp/c
+rustc --test src/query.rs    -o /tmp/q && /tmp/q
 ```
