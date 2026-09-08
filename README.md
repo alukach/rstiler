@@ -203,6 +203,40 @@ Reading a deep array needs a different access pattern from walking the chain:
 the file*, which is right for the front matter and wrong for an array megabytes
 in. `BlockFetch` coalesces around whatever it was asked for instead.
 
+The chain walk needs it too, which was not obvious. A COG is *supposed* to keep
+its IFDs at the front, and plenty do not: NLCD's CONUS land cover puts its
+overview IFDs **962 MB into a 1.4 GB file**. Walking out to them sequentially
+pulls the whole gigabyte through a Worker capped at 128 MB, which is a hard
+failure rather than a slow one. Reading the chain in blocks turns that into
+four reads of 128 KiB. `layout_trailing_overviews.tif` is the regression
+fixture — `gdaladdo` on a plain TIFF appends overviews after the image data,
+reproducing the layout exactly.
+
+### CPU is the tighter budget
+
+A Cloudflare Worker on the free plan gets **10 ms of CPU per request**; the
+paid plan gets up to 30 s. Rendering a tile does not fit in 10 ms, and the
+reason was reprojection: transforming all 65,536 output pixels through
+`proj4rs`. Measured on one fixture rendered twice, once where the source is
+already Web Mercator so no transform runs and once where it is UTM:
+
+| | render CPU |
+|---|---|
+| no reprojection | 3 ms |
+| exact, per pixel | 21–24 ms |
+| **grid-approximated** | **3–4 ms** |
+
+`src/warp.rs` approximates the transform over a 17×17 grid and interpolates
+between the nodes — what `gdalwarp` does — then checks itself against the exact
+transform at every cell centre and falls back to exact everywhere if any cell
+drifts past 0.125 source pixels. On the fixtures the approximated output is
+**byte-identical** to the exact path, and `check.py` guards it by comparing the
+reprojected fixtures against `gdalwarp` and asserting how many pixels disagree,
+since a broken approximation smears many rather than shifting one.
+
+Even so, image work does not comfortably fit the free tier's 10 ms once source
+tiles have to be decoded. Workers Paid is the right home for this.
+
 Rendering itself was never the problem — reprojection, resampling and PNG
 encoding total 17–77 ms per tile.
 

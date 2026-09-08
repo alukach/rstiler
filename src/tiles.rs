@@ -12,6 +12,7 @@ use crate::geo::{source_crs, transform_of, Reproject};
 use crate::query::Query;
 use crate::render::{band_indices, colormap, png_response, resampling, rescale, sample};
 use crate::tiling::{pick_overview, tile_bounds};
+use crate::warp::Warp;
 use crate::{MAX_SOURCE_TILES, TILE};
 
 pub(crate) async fn tile(src: &str, z: &str, x: &str, y: &str, q: &Query) -> Out<Response> {
@@ -110,6 +111,14 @@ pub(crate) async fn tile(src: &str, z: &str, x: &str, y: &str, q: &Query) -> Out
         None => nodata_of(ifd),
     };
 
+    // Now that the level is known, the tolerance has a unit: one source pixel.
+    let warp = Warp::new(
+        &reproject,
+        (xmin, ymin, xmax, ymax),
+        TILE,
+        t.res_x.min(t.res_y) * scale,
+    );
+
     let (iw, ih) = (ifd.image_width() as f64, ifd.image_height() as f64);
     let (px0, py0) = t.world_to_pixel(wx0, wy1, scale);
     let (px1, py1) = t.world_to_pixel(wx1, wy0, scale);
@@ -175,7 +184,7 @@ pub(crate) async fn tile(src: &str, z: &str, x: &str, y: &str, q: &Query) -> Out
     let mut rgba = vec![0u8; TILE * TILE * 4];
     for oy in 0..TILE {
         for ox in 0..TILE {
-            let Some((wx, wy)) = at(ox as f64, oy as f64) else {
+            let Some((wx, wy)) = warp.at(ox as f64, oy as f64) else {
                 continue;
             };
             let (fx, fy) = t.world_to_pixel(wx, wy, scale);
@@ -220,10 +229,15 @@ pub(crate) async fn tile(src: &str, z: &str, x: &str, y: &str, q: &Query) -> Out
     // Where the time went, per tile: metadata walk, source reads, resample.
     let (reqs, hits, bytes) = cog.reader.traffic();
     let timing = format!(
-        "meta;dur={t_meta}, fetch;dur={t_fetch};desc=\"{} tiles\", render;dur={}, \
-         origin;desc=\"{} reads, {hits} cached, {} KiB\"",
+        "meta;dur={t_meta}, fetch;dur={t_fetch};desc=\"{} tiles\", \
+         render;dur={};desc=\"{}\", origin;desc=\"{} reads, {hits} cached, {} KiB\"",
         coords.len(),
         Date::now().as_millis() - t2,
+        if warp.is_approximate() {
+            "grid warp"
+        } else {
+            "exact warp"
+        },
         reqs - hits,
         bytes / 1024
     );

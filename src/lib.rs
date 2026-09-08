@@ -12,6 +12,7 @@ mod query;
 mod render;
 mod tiles;
 mod tiling;
+mod warp;
 
 use worker::*;
 

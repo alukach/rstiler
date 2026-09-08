@@ -99,6 +99,14 @@ def opaque(path):
     return sum(1 for i in range(w * h) if n < 4 or d[i * n + 3] > 0)
 
 
+def differing(a, b):
+    """How many pixels disagree at all, ignoring by how much."""
+    w, h, n, da = load_png(a)
+    _, _, n2, db = load_png(b)
+    return sum(1 for i in range(w * h)
+               if any(da[i * n + c] != db[i * n2 + c] for c in range(3)))
+
+
 def maxdiff(a, b):
     w, h, n, da = load_png(a)
     _, _, n2, db = load_png(b)
@@ -183,7 +191,27 @@ def assertions():
         print(f"  {'ok' if d == 0 else 'FAIL'}    gdalwarp byte-identity          max channel diff {d}")
         if d: bad.append("gdalwarp")
 
-    # 2. The same ground point must read the same through three projections.
+    # 2. Reprojected output must stay close to GDAL's. The transform is
+    #    approximated over a coarse grid (src/warp.rs); if that ever drifts it
+    #    smears many pixels, so assert on how many disagree rather than on the
+    #    largest single difference. A handful differ inherently: nearest
+    #    neighbour picks a different source pixel right at a boundary, and this
+    #    fixture's blue channel is a checkerboard that jumps by 200 there.
+    for name in ("synthetic_rgb_4326", "synthetic_rgb_32618"):
+        curl(f"/cog/tiles/{Z}/{X}/{Y}.png?url={url_for(name + '.tif')}", "/tmp/w.png")
+        if subprocess.run(["gdalwarp", "-q", "-overwrite", "-t_srs", "EPSG:3857", "-te",
+                           *map(str, te), "-ts", "256", "256", "-r", "near",
+                           str(HERE / f"{name}.tif"), "/tmp/wref.tif"]).returncode == 0:
+            subprocess.run(["gdal_translate", "-q", "-of", "PNG", "-b", "1", "-b", "2",
+                            "-b", "3", "/tmp/wref.tif", "/tmp/wref.png"], check=True)
+            n_diff = differing("/tmp/w.png", "/tmp/wref.png")
+            okw = n_diff <= 66  # 0.1% of 65,536
+            print(f"  {'ok' if okw else 'FAIL'}    warp vs gdalwarp {name[10:]:<13} "
+                  f"{n_diff} px differ of 65536")
+            if not okw:
+                bad.append(f"warp/{name}")
+
+    # 3. The same ground point must read the same through three projections.
     want = subprocess.run(["gdallocationinfo", "-wgs84", "-valonly",
                            str(HERE / "synthetic_rgb_3857.tif"), "-73.93", "40.80"],
                           capture_output=True, text=True, check=False).stdout.split()
@@ -194,7 +222,7 @@ def assertions():
         print(f"  {'ok' if okp else 'FAIL'}    point through EPSG:{v:<6}        {','.join(got)}")
         if not okp: bad.append(f"point/{v}")
 
-    # 3. A colormap must produce colour, not grey.
+    # 4. A colormap must produce colour, not grey.
     base = f"/cog/tiles/{Z}/{X}/{Y}.png?url={url_for('synthetic_dem_int16.tif')}&rescale=-2000,8000"
     curl(base + "&colormap_name=viridis", "/tmp/v.png")
     curl(base + "&colormap_name=greys", "/tmp/g.png")
