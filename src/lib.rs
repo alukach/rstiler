@@ -5,6 +5,7 @@
 mod cog;
 mod colormap;
 mod geo;
+mod lazyifd;
 mod meta;
 mod render;
 mod tiles;

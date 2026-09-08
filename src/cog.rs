@@ -7,9 +7,10 @@ use std::sync::Arc;
 use async_tiff::decoder::{Decoder, DecoderRegistry};
 use async_tiff::error::{AsyncTiffError, AsyncTiffResult};
 use async_tiff::metadata::cache::ReadaheadMetadataCache;
-use async_tiff::metadata::TiffMetadataReader;
 use async_tiff::reader::AsyncFileReader;
 use async_tiff::{ImageFileDirectory, TIFF};
+
+use crate::lazyifd::Levels;
 use async_trait::async_trait;
 use bytes::Bytes;
 use worker::*;
@@ -23,6 +24,7 @@ pub(crate) struct HttpReader {
     /// of size, so these two numbers explain nearly all of a response's latency.
     reqs: Arc<AtomicUsize>,
     hits: Arc<AtomicUsize>,
+    bytes: Arc<AtomicUsize>,
 }
 
 impl HttpReader {
@@ -31,12 +33,17 @@ impl HttpReader {
             url: url.to_string(),
             reqs: Arc::new(AtomicUsize::new(0)),
             hits: Arc::new(AtomicUsize::new(0)),
+            bytes: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    /// `(range requests issued, of which served from cache)`.
-    pub(crate) fn traffic(&self) -> (usize, usize) {
-        (self.reqs.load(Ordering::Relaxed), self.hits.load(Ordering::Relaxed))
+    /// `(range requests issued, of which served from cache, bytes read)`.
+    pub(crate) fn traffic(&self) -> (usize, usize, usize) {
+        (
+            self.reqs.load(Ordering::Relaxed),
+            self.hits.load(Ordering::Relaxed),
+            self.bytes.load(Ordering::Relaxed),
+        )
     }
 
     /// A synthetic key naming this exact byte range. Never fetched — the Cache
@@ -63,6 +70,7 @@ impl AsyncFileReader for HttpReader {
         if let Ok(Some(mut hit)) = cache.get(&key, true).await {
             if let Ok(body) = hit.bytes().await {
                 self.hits.fetch_add(1, Ordering::Relaxed);
+                self.bytes.fetch_add(body.len(), Ordering::Relaxed);
                 return Ok(Bytes::from(body));
             }
         }
@@ -88,6 +96,7 @@ impl AsyncFileReader for HttpReader {
             )));
         }
         let body = resp.bytes().await.map_err(tiff_err)?;
+        self.bytes.fetch_add(body.len(), Ordering::Relaxed);
 
         // ponytail: time-based, with no ETag revalidation. A COG that is
         // overwritten in place under the same URL would serve stale bytes for a
@@ -156,28 +165,46 @@ pub(crate) fn decoders() -> DecoderRegistry {
     r
 }
 
-pub(crate) async fn open(src: &str) -> Result<(HttpReader, TIFF)> {
-    let reader = HttpReader::new(src);
-    // A big COG's TileOffsets/TileByteCounts arrays run to hundreds of KB, and
-    // the 32 KiB default walks out to them one doubling per round trip.
-    let cache = ReadaheadMetadataCache::new(reader.clone()).with_initial_size(1024 * 1024);
-    let mut meta = TiffMetadataReader::try_open(&cache)
-        .await
-        .map_err(|e| Error::RustError(format!("open failed: {e}")))?;
-    let ifds = meta
-        .read_all_ifds(&cache)
-        .await
-        .map_err(|e| Error::RustError(format!("ifd read failed: {e}")))?;
-    let endianness = meta.endianness();
-    Ok((reader, TIFF::new(ifds, endianness)))
+/// An open COG: the reader, the metadata cache in front of it, and the IFD
+/// chain parsed without its per-tile arrays.
+pub(crate) struct Cog {
+    pub(crate) reader: HttpReader,
+    levels: Levels,
 }
 
-/// Image IFDs only — COGs also carry mask IFDs (NewSubfileType bit 2).
-pub(crate) fn image_ifds(tiff: &TIFF) -> Vec<&ImageFileDirectory> {
-    tiff.ifds()
-        .iter()
-        .filter(|i| i.new_subfile_type().unwrap_or(0) & 4 == 0)
-        .collect()
+impl Cog {
+    pub(crate) async fn open(src: &str) -> Result<Self> {
+        let reader = HttpReader::new(src);
+        // A COG's IFD chain sits at the front of the file, and the walk below
+        // skips the per-tile arrays, so 256 KiB covers it in one read.
+        let cache = ReadaheadMetadataCache::new(reader.clone()).with_initial_size(256 * 1024);
+        let levels = Levels::open(&cache)
+            .await
+            .map_err(|e| Error::RustError(format!("could not read metadata: {e}")))?;
+        if levels.light().is_empty() {
+            return Err(Error::RustError("no image IFDs in this TIFF".into()));
+        }
+        Ok(Self { reader, levels })
+    }
+
+    /// Per-level metadata, cheap — no per-tile arrays were read.
+    pub(crate) fn levels(&self) -> &[ImageFileDirectory] {
+        self.levels.light()
+    }
+
+    /// Read one level with its per-tile arrays, so its pixels can be fetched.
+    pub(crate) async fn full(&self, level: usize) -> Result<TIFF> {
+        self.levels
+            .full(&self.reader, level)
+            .await
+            .map_err(|e| Error::RustError(format!("could not read level {level}: {e}")))
+    }
+
+    /// Index of the coarsest level, which is where sampling for statistics
+    /// costs least.
+    pub(crate) fn coarsest(&self) -> usize {
+        self.levels.light().len() - 1
+    }
 }
 
 pub(crate) fn nodata_of(ifd: &ImageFileDirectory) -> Option<f64> {

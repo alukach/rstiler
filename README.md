@@ -147,19 +147,31 @@ A 1 MiB initial readahead collapses the whole IFD walk into a *single* range
 read on most COGs, and `HttpReader` caches each `(url, range)` in the Workers
 Cache API, so every later request for the same COG header is edge-local.
 
-Rendered tiles are cached too, which matters more than it first looks. A COG
-with a deep pyramid carries a lot of metadata — a 463832 × 102252 raster has
-181,200 tile offsets at full resolution alone, ~3.7 MiB of tag arrays across
-the chain — and we parse all of it to serve one overview level. That is ~100 ms
-of CPU on every tile even when every source byte is already cached. Caching the
-PNG skips it:
+Rendered tiles are cached too, keyed by crate version so a release that changes
+rendering does not serve pixels drawn by the previous one.
 
-| | first | cached |
+But caching only helps the second visitor. The first one was paying for
+metadata nobody asked for: `async-tiff`'s `read_all_ifds` materialises every
+tag of every level, and `TileOffsets`/`TileByteCounts` hold one entry per tile.
+A 463832 × 102252 raster carries 181,200 tile offsets at full resolution alone
+— ~3.7 MiB of arrays across the chain — and `/cog/info` needs *none* of them,
+while a tile needs one level's worth.
+
+`src/lazyifd.rs` walks the chain reading only the small tags, then pulls the
+per-tile arrays for the single level it will read pixels from. Reducing the
+readahead does not help here and was measured: even at 16 KiB the old path
+still pulled 3888 KiB, because the parse genuinely spans every array.
+
+| cold, nothing cached | before | after |
 |---|---|---|
-| tile, deep-pyramid COG | 0.10 – 1.1 s | **~3 ms** |
+| `/cog/info` | 3072 KiB, 0.49 s | **256 KiB, 0.24 s** |
+| tile at z7 | 3785 KiB, 1.11 s | **1993 KiB, 0.65 s** |
+| metadata parse (`meta;dur`) | 803 ms cold, 110 ms warm | **1–4 ms** |
 
-The tile cache is keyed by crate version, so a release that changes rendering
-does not serve pixels drawn by the previous one.
+Reading a deep array needs a different access pattern from walking the chain:
+`ReadaheadMetadataCache` coalesces by reading sequentially *from the start of
+the file*, which is right for the front matter and wrong for an array megabytes
+in. `BlockFetch` coalesces around whatever it was asked for instead.
 
 Rendering itself was never the problem — reprojection, resampling and PNG
 encoding total 17–77 ms per tile.
@@ -168,17 +180,14 @@ encoding total 17–77 ms per tile.
 
 1. **ETag revalidation on the caches.** Both are time-based today, so a COG
    overwritten in place under the same URL serves stale bytes for a day.
-2. **Lazy IFD parsing.** We parse the whole chain to pick one overview level;
-   on a large COG that is megabytes of tile offsets and ~100 ms of CPU per
-   uncached tile. Only the chosen level's arrays are actually needed.
-3. **`/cog/preview` and `/cog/bbox`** — both fall out of generalising the tile
+2. **`/cog/preview` and `/cog/bbox`** — both fall out of generalising the tile
    pipeline to render an arbitrary window at an arbitrary size, which is worth
    doing on its own.
-4. **`expression` band math** — the largest genuinely useful gap, and the one
+3. **`expression` band math** — the largest genuinely useful gap, and the one
    that needs a real parser.
-5. **JPEG and WebP output** — `image-webp` already ships for decoding; a pure-Rust
+4. **JPEG and WebP output** — `image-webp` already ships for decoding; a pure-Rust
    JPEG encoder would cut tile bytes substantially for imagery.
-6. **Multiple TileMatrixSets** — deep rather than hard; the Web Mercator
+5. **Multiple TileMatrixSets** — deep rather than hard; the Web Mercator
    assumption is spread across bounds, overview selection and zoom derivation.
 
 Also unsupported, with no plans: stripped (non-tiled) TIFFs, planar
@@ -213,6 +222,7 @@ datum grid shifts, which is far below one pixel.
 | `src/lib.rs` | constants and the router |
 | `src/cog.rs` | byte access, decoders, opening the IFD chain |
 | `src/geo.rs` | CRS lookup, reprojection, affine transform, bounds |
+| `src/lazyifd.rs` | walking the IFD chain without its per-tile arrays |
 | `src/tiling.rs` | Web Mercator ↔ pixel math (pure, no deps) |
 | `src/tiles.rs` | the tile handler: the resampling pipeline |
 | `src/meta.rs` | `/cog/info` and `/cog/tilejson.json` |

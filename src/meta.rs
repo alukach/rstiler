@@ -3,15 +3,15 @@
 use async_tiff::ImageFileDirectory;
 use worker::*;
 
-use crate::cog::{decoders, image_ifds, nodata_of, open, HttpReader};
+use crate::cog::{decoders, nodata_of, Cog, HttpReader};
 use crate::geo::{source_crs, transform_of, wgs84_bounds, Crs, Reproject};
 use crate::render::sample;
 use crate::{tiling, STATS_TILES, TILE};
 
 pub(crate) async fn info(src: &str) -> Result<Response> {
-    let (reader, tiff) = open(src).await?;
-    let ifds = image_ifds(&tiff);
-    let ifd = ifds[0];
+    let cog = Cog::open(src).await?;
+    let ifds = cog.levels();
+    let ifd = &ifds[0];
     let t = transform_of(ifd)?;
     let crs = source_crs(ifd)?;
     let bands = ifd.samples_per_pixel() as usize;
@@ -29,15 +29,19 @@ pub(crate) async fn info(src: &str) -> Result<Response> {
         "resolution": [t.res_x, t.res_y],
         "bounds": wgs84_bounds(&t, &crs, ifd.image_width(), ifd.image_height())?,
     }))
-    .map(|r| timed(r, &reader))
+    .map(|r| timed(r, &cog.reader))
 }
 
 /// Attaches the range-request accounting that explains a response's latency.
 fn timed(mut resp: Response, reader: &HttpReader) -> Response {
-    let (reqs, hits) = reader.traffic();
+    let (reqs, hits, bytes) = reader.traffic();
     let _ = resp.headers_mut().set(
         "Server-Timing",
-        &format!("origin;desc=\"{} range reads, {hits} cached\"", reqs - hits),
+        &format!(
+            "origin;desc=\"{} range reads, {hits} cached, {} KiB\"",
+            reqs - hits,
+            bytes / 1024
+        ),
     );
     resp
 }
@@ -48,17 +52,20 @@ fn timed(mut resp: Response, reader: &HttpReader) -> Response {
 /// this a full-resolution read, and origins charge ~2 s per range request. Keep
 /// `/cog/info` to metadata a client always needs.
 pub(crate) async fn statistics(src: &str) -> Result<Response> {
-    let (reader, tiff) = open(src).await?;
-    let ifds = image_ifds(&tiff);
-    let bands = ifds[0].samples_per_pixel() as usize;
-    let stats = percentiles(ifds[ifds.len() - 1], &reader, nodata_of(ifds[0]), bands).await?;
+    let cog = Cog::open(src).await?;
+    let bands = cog.levels()[0].samples_per_pixel() as usize;
+    let nodata = nodata_of(&cog.levels()[0]);
+    // Sample the coarsest level: fewest tiles, and its arrays are the smallest
+    // to read.
+    let coarse = cog.full(cog.coarsest()).await?;
+    let stats = percentiles(&coarse.ifds()[0], &cog.reader, nodata, bands).await?;
 
     let body: serde_json::Map<String, serde_json::Value> = stats
         .iter()
         .enumerate()
         .map(|(i, s)| (format!("b{}", i + 1), serde_json::to_value(s).unwrap()))
         .collect();
-    Response::from_json(&body).map(|r| timed(r, &reader))
+    Response::from_json(&body).map(|r| timed(r, &cog.reader))
 }
 
 /// Per-band summary, computed from a sample of one overview level.
@@ -137,9 +144,9 @@ pub(crate) async fn percentiles(
 }
 
 pub(crate) async fn tilejson(src: &str, req_url: &Url) -> Result<Response> {
-    let (reader, tiff) = open(src).await?;
-    let ifds = image_ifds(&tiff);
-    let ifd = ifds[0];
+    let cog = Cog::open(src).await?;
+    let ifds = cog.levels();
+    let ifd = &ifds[0];
     let t = transform_of(ifd)?;
     let crs = source_crs(ifd)?;
     let b = wgs84_bounds(&t, &crs, ifd.image_width(), ifd.image_height())?;
@@ -181,7 +188,7 @@ pub(crate) async fn tilejson(src: &str, req_url: &Url) -> Result<Response> {
         "bounds": b,
         "center": [(b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0, minzoom],
     }))
-    .map(|r| timed(r, &reader))
+    .map(|r| timed(r, &cog.reader))
 }
 
 /// `/cog/point/{lon},{lat}` — the raw band values under one coordinate.
@@ -196,9 +203,9 @@ pub(crate) async fn point(src: &str, coords: &str) -> Result<Response> {
         )));
     };
 
-    let (reader, tiff) = open(src).await?;
-    let ifds = image_ifds(&tiff);
-    let ifd = ifds[0];
+    let cog = Cog::open(src).await?;
+    let ifds = cog.levels();
+    let ifd = &ifds[0];
     let t = transform_of(ifd)?;
     let crs = source_crs(ifd)?;
 
@@ -211,6 +218,9 @@ pub(crate) async fn point(src: &str, coords: &str) -> Result<Response> {
         return Err(Error::RustError("point is outside the image".into()));
     }
 
+    // Only now do we need level 0's per-tile arrays.
+    let full = cog.full(0).await?;
+    let ifd = &full.ifds()[0];
     let tw = ifd
         .tile_width()
         .ok_or_else(|| Error::RustError("not a tiled TIFF (stripped COGs unsupported)".into()))?
@@ -219,7 +229,7 @@ pub(crate) async fn point(src: &str, coords: &str) -> Result<Response> {
     let (px, py) = (fx as usize, fy as usize);
 
     let arr = ifd
-        .fetch_tile(px / tw, py / th, &reader)
+        .fetch_tile(px / tw, py / th, &cog.reader)
         .await
         .map_err(|e| Error::RustError(format!("tile fetch failed: {e}")))?
         .decode(&decoders())

@@ -6,7 +6,7 @@ use async_tiff::tags::PlanarConfiguration;
 use async_tiff::TypedArray;
 use worker::*;
 
-use crate::cog::{decoders, image_ifds, nodata_of, open};
+use crate::cog::{decoders, nodata_of, Cog};
 use crate::geo::{transform_of, source_crs, Reproject};
 use crate::render::{band_indices, colormap, png_response, rescale, resampling, sample};
 use crate::tiling::{pick_overview, tile_bounds};
@@ -27,14 +27,14 @@ pub(crate) async fn tile(
     let (z, x, y) = (parse(z, "z")?, parse(x, "x")?, parse(y, "y")?);
 
     let t0 = Date::now().as_millis();
-    let (reader, tiff) = open(src).await?;
+    let cog = Cog::open(src).await?;
     let t_meta = Date::now().as_millis() - t0;
-    let ifds = image_ifds(&tiff);
-    let full = ifds[0];
-    let t = transform_of(full)?;
-    let reproject = Reproject::new(&source_crs(full)?)?;
+    let ifds = cog.levels();
+    let base = &ifds[0];
+    let t = transform_of(base)?;
+    let reproject = Reproject::new(&source_crs(base)?)?;
 
-    if full.planar_configuration() != PlanarConfiguration::Chunky {
+    if base.planar_configuration() != PlanarConfiguration::Chunky {
         // ponytail: planar TIFFs are rare in the wild; add band-plane
         // reassembly here if one shows up.
         return Err(Error::RustError("planar TIFFs not supported".into()));
@@ -82,8 +82,11 @@ pub(crate) async fn tile(
     let target_res = ((wx1 - wx0) / TILE as f64).max((wy1 - wy0) / TILE as f64);
     let widths: Vec<u32> = ifds.iter().map(|i| i.image_width()).collect();
     let level = pick_overview(&widths, t.res_x, target_res);
-    let ifd = ifds[level];
     let scale = widths[0] as f64 / widths[level] as f64;
+
+    // Only the chosen level's per-tile arrays are worth reading.
+    let chosen = cog.full(level).await?;
+    let ifd = &chosen.ifds()[0];
 
     let colormap = colormap(q)?;
     let bands = band_indices(q, ifd.samples_per_pixel() as usize)?;
@@ -139,7 +142,7 @@ pub(crate) async fn tile(
 
     let t1 = Date::now().as_millis();
     let fetched = ifd
-        .fetch_tiles(&coords, &reader)
+        .fetch_tiles(&coords, &cog.reader)
         .await
         .map_err(|e| Error::RustError(format!("tile fetch failed: {e}")))?;
     let t_fetch = Date::now().as_millis() - t1;
@@ -212,10 +215,14 @@ pub(crate) async fn tile(
     }
 
     // Where the time went, per tile: metadata walk, source reads, resample.
+    let (reqs, hits, bytes) = cog.reader.traffic();
     let timing = format!(
-        "meta;dur={t_meta}, fetch;dur={t_fetch};desc=\"{} tiles\", render;dur={}",
+        "meta;dur={t_meta}, fetch;dur={t_fetch};desc=\"{} tiles\", render;dur={}, \
+         origin;desc=\"{} reads, {hits} cached, {} KiB\"",
         coords.len(),
-        Date::now().as_millis() - t2
+        Date::now().as_millis() - t2,
+        reqs - hits,
+        bytes / 1024
     );
     let mut resp = png_response(&rgba)?;
     resp.headers_mut().set("Server-Timing", &timing)?;
