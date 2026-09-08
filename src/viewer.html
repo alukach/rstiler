@@ -113,19 +113,47 @@ function clear() {
   meta.innerHTML = "";
 }
 
+/// Rewrite the address bar so the current view can be copied or reloaded.
+/// Called on every pan and zoom, so it must stay cheap and must not push
+/// history entries — the back button should leave the viewer, not retrace it.
+function share() {
+  const url = $("url").value.trim();
+  if (!url) return;
+  const q = new URLSearchParams({ url });
+  for (const k of ["bidx", "rescale", "colormap_name"]) {
+    const v = (k === "colormap_name" ? $("colormap") : $(k)).value.trim();
+    if (v) q.set(k, v);
+  }
+  // getBounds works as soon as the map is constructed — do not gate this on
+  // the style having loaded, or a slow basemap silently drops the bbox.
+  try {
+    const b = map.getBounds();
+    // west,south,east,north — the order OGC services and /cog/bbox use.
+    // Six decimals is ~10cm, well past what a map view needs.
+    q.set("bbox", [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()]
+      .map(v => +v.toFixed(6)).join(","));
+  } catch { /* not positioned yet; the parameters alone still share fine */ }
+  history.replaceState(null, "", "?" + q);
+}
+
+/// Frame the map on a `bbox=` from the address bar. Returns false when there
+/// is not a usable one, so the caller falls back to the dataset's own extent.
+function applyBbox(raw) {
+  const v = (raw || "").split(",").map(Number);
+  if (v.length !== 4 || v.some(Number.isNaN)) return false;
+  const [w, s2, e, n] = v;
+  if (w >= e || s2 >= n) return false;
+  map.fitBounds([[w, s2], [e, n]], { padding: 0, animate: false });
+  return true;
+}
+
 async function load() {
   const url = $("url").value.trim();
   if (!url) return;
   clear();
   say("Reading COG metadata…", "ok");
 
-  // Keep the URL shareable and reloadable.
-  const share = new URLSearchParams({ url });
-  for (const k of ["bidx", "rescale", "colormap_name"]) {
-    const v = (k === "colormap_name" ? $("colormap") : $(k)).value.trim();
-    if (v) share.set(k, v);
-  }
-  history.replaceState(null, "", "?" + share);
+  share();
 
   let info;
   try {
@@ -181,7 +209,11 @@ async function load() {
   map.addSource("cog", { type: "raster", tiles: tj.tiles, tileSize: 256,
                          bounds: tj.bounds, minzoom: tj.minzoom, maxzoom: tj.maxzoom });
   map.addLayer({ id: "cog", type: "raster", source: "cog" });
-  map.fitBounds([[tj.bounds[0], tj.bounds[1]], [tj.bounds[2], tj.bounds[3]]], { padding: 30 });
+  // A shared link says where to look; without one, frame the whole dataset.
+  if (!applyBbox(pendingBbox)) {
+    map.fitBounds([[tj.bounds[0], tj.bounds[1]], [tj.bounds[2], tj.bounds[3]]], { padding: 30 });
+  }
+  pendingBbox = null;
   say(`zoom ${tj.minzoom}–${tj.maxzoom} · rescale ${rescale || "0,255"}`, "ok");
 
   // Tiles are rendered in the Worker, so a failure there is the interesting one.
@@ -205,12 +237,17 @@ function drawRamp() {
   ramp.style.background = css ? `linear-gradient(to right, ${css})` : "";
 }
 
+// moveend covers pan, zoom and fitBounds alike, and only fires once settled.
+map.on("moveend", share);
+
 $("colormap").onchange = () => { drawRamp(); if ($("url").value.trim()) load(); };
 drawRamp();
 $("load").onclick = load;
 $("url").onkeydown = e => { if (e.key === "Enter") load(); };
 
 const p = new URLSearchParams(location.search);
+// Held until the layer is added, so fitBounds is not undone by the dataset fit.
+let pendingBbox = p.get("bbox");
 if (p.get("url")) {
   $("url").value = p.get("url");
   $("bidx").value = p.get("bidx") || "";
