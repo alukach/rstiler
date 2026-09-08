@@ -39,10 +39,14 @@ python3 fixtures/serve.py &        # :8099
 wrangler dev &                     # :8787
 python3 fixtures/check.py                  # formats and rendering
 python3 fixtures/conformance.py            # titiler's contract
-rustc --test src/tiling.rs   -o /tmp/t && /tmp/t
-rustc --test src/colormap.rs -o /tmp/c && /tmp/c
-rustc --test src/query.rs    -o /tmp/q && /tmp/q
+./fixtures/unit.sh                         # tiling, colormap, query
+cargo fmt --check
+cargo clippy --target wasm32-unknown-unknown --release --all-features -- -D warnings
 ```
+
+CI runs exactly these, so a green local run means a green pipeline. Clippy is
+`-D warnings` and the tree is clean — fix a lint rather than allowing it, and
+if a lint is genuinely wrong, `#[allow]` it with a comment saying why.
 
 `check.py` is the gate for anything touching the tile pipeline, and its
 `KNOWN_GAPS` dict is the gap list in executable form. Three rules:

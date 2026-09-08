@@ -7,8 +7,8 @@ mod colormap;
 mod fail;
 mod geo;
 mod lazyifd;
-mod query;
 mod meta;
+mod query;
 mod render;
 mod tiles;
 mod tiling;
@@ -103,6 +103,9 @@ async fn route(parts: &[&str], url: &Url, q: &Query) -> Out<Response> {
         ["cog", "tiles", z, x, y] => tile(&src, z, x, y, q).await,
         ["cog", "point", coords] => point(&src, coords, q).await,
         ["cog", "statistics"] => statistics(&src, q).await,
-        _ => Err(Fail::not_found(format!("no route for /{}", parts.join("/")))),
+        _ => Err(Fail::not_found(format!(
+            "no route for /{}",
+            parts.join("/")
+        ))),
     }
 }

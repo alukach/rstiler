@@ -55,14 +55,10 @@ mod tests {
     use super::*;
 
     fn q(s: &str) -> Query {
-        Query::new(
-            s.split('&')
-                .filter(|p| !p.is_empty())
-                .map(|p| {
-                    let (k, v) = p.split_once('=').unwrap_or((p, ""));
-                    (k.to_string(), v.to_string())
-                }),
-        )
+        Query::new(s.split('&').filter(|p| !p.is_empty()).map(|p| {
+            let (k, v) = p.split_once('=').unwrap_or((p, ""));
+            (k.to_string(), v.to_string())
+        }))
     }
 
     #[test]

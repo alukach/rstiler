@@ -66,7 +66,12 @@ mod tests {
 
     #[test]
     fn pixel_lookup_round_trips() {
-        let t = Transform { origin_x: -100.0, origin_y: 200.0, res_x: 10.0, res_y: 10.0 };
+        let t = Transform {
+            origin_x: -100.0,
+            origin_y: 200.0,
+            res_x: 10.0,
+            res_y: 10.0,
+        };
         assert_eq!(t.world_to_pixel(-100.0, 200.0, 1.0), (0.0, 0.0));
         assert_eq!(t.world_to_pixel(-50.0, 150.0, 1.0), (5.0, 5.0));
         // an overview at half resolution puts the same point at half the index
@@ -77,7 +82,15 @@ mod tests {
     fn overview_choice_tracks_zoom() {
         let widths = [1000, 500, 250]; // full res 10 m/px
         assert_eq!(pick_overview(&widths, 10.0, 5.0), 0, "zoomed in: full res");
-        assert_eq!(pick_overview(&widths, 10.0, 20.0), 1, "2x out: first overview");
-        assert_eq!(pick_overview(&widths, 10.0, 9999.0), 2, "zoomed way out: coarsest");
+        assert_eq!(
+            pick_overview(&widths, 10.0, 20.0),
+            1,
+            "2x out: first overview"
+        );
+        assert_eq!(
+            pick_overview(&widths, 10.0, 9999.0),
+            2,
+            "zoomed way out: coarsest"
+        );
     }
 }

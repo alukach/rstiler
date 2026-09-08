@@ -168,7 +168,9 @@ async fn read_tags<F: MetadataFetch>(
     let count = match (bigtiff, endianness) {
         (true, Endianness::LittleEndian) => u64::from_le_bytes(raw[..8].try_into().unwrap()),
         (true, Endianness::BigEndian) => u64::from_be_bytes(raw[..8].try_into().unwrap()),
-        (false, Endianness::LittleEndian) => u16::from_le_bytes(raw[..2].try_into().unwrap()) as u64,
+        (false, Endianness::LittleEndian) => {
+            u16::from_le_bytes(raw[..2].try_into().unwrap()) as u64
+        }
         (false, Endianness::BigEndian) => u16::from_be_bytes(raw[..2].try_into().unwrap()) as u64,
     };
 

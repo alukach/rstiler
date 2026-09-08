@@ -1,0 +1,145 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Advisories appear without anyone pushing, so audit on a timer too.
+  schedule:
+    - cron: "17 6 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+  # The crate only ever builds for wasm; keep every job on one target so they
+  # share a cache and nothing is checked against a target we do not ship.
+  TARGET: wasm32-unknown-unknown
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: cargo fmt --check
+      - name: clippy
+        # Warnings are failures here; the tree is clean and should stay that way.
+        run: cargo clippy --target $TARGET --release --all-features -- -D warnings
+
+  unit:
+    name: unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: ./fixtures/unit.sh
+
+  build:
+    name: wasm build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: cargo build --target $TARGET --release
+      - name: report bundle size
+        run: |
+          wasm=$(find target/$TARGET/release -name '*.wasm' | head -1)
+          printf '### wasm bundle\n\n| | bytes |\n|---|---|\n| raw | %s |\n| gzipped | %s |\n' \
+            "$(stat -c%s "$wasm")" "$(gzip -c "$wasm" | wc -c)" >> "$GITHUB_STEP_SUMMARY"
+
+  integration:
+    name: fixtures + titiler conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      # GDAL builds the fixtures and is the reference the tile output is
+      # checked against — gdalwarp and gdallocationinfo, specifically.
+      - name: install GDAL
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gdal-bin
+
+      - name: build fixtures
+        # --all pulls developmentseed/geotiff-test-data for format coverage.
+        run: ./fixtures/setup.sh --all
+
+      - name: build worker
+        run: |
+          cargo install -q worker-build --version ^0.8
+          worker-build --release
+
+      - name: start servers
+        run: |
+          python3 fixtures/serve.py 8099 > /tmp/serve.log 2>&1 &
+          npx --yes wrangler@4 dev --port 8787 --ip 127.0.0.1 > /tmp/wrangler.log 2>&1 &
+          # Wait for readiness rather than sleeping a guessed interval.
+          for _ in $(seq 60); do
+            curl -sf -o /dev/null http://127.0.0.1:8787/cog/viewer && exit 0
+            sleep 2
+          done
+          echo "::error::worker did not come up"; tail -40 /tmp/wrangler.log; exit 1
+
+      - name: format coverage + gdal comparison
+        run: python3 fixtures/check.py
+
+      - name: titiler conformance
+        run: python3 fixtures/conformance.py
+
+      - if: failure()
+        run: tail -60 /tmp/wrangler.log /tmp/serve.log
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  deploy:
+    name: deploy
+    needs: [lint, unit, build, integration, audit]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2.9.2
+
+      # Deploying is opt-in: a fork, or a clone without the secret, runs every
+      # check above and stops here rather than failing on a missing token.
+      - id: secret
+        run: echo "present=${{ secrets.CLOUDFLARE_API_TOKEN != '' }}" >> "$GITHUB_OUTPUT"
+
+      - if: steps.secret.outputs.present != 'true'
+        run: echo "::notice::CLOUDFLARE_API_TOKEN not set — skipping deploy"
+
+      - if: steps.secret.outputs.present == 'true'
+        uses: cloudflare/wrangler-action@v4.0.0
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

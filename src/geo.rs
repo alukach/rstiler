@@ -1,9 +1,9 @@
 //! Everything CRS-shaped: reading the COG's projection, moving Web Mercator
 //! coordinates into it, and reporting geographic bounds.
 
+use crate::fail::{Fail, Out};
 use async_tiff::geo::GeoKeyDirectory;
 use async_tiff::ImageFileDirectory;
-use crate::fail::{Fail, Out};
 
 use crate::tiling::Transform;
 use crate::WEB_MERCATOR;
@@ -102,7 +102,10 @@ fn proj_string_from_geokeys(gk: &GeoKeyDirectory) -> Out<String> {
         .or(gk.proj_false_northing)
         .or(gk.proj_center_northing)
         .unwrap_or(0.0);
-    let k0 = gk.proj_scale_at_nat_origin.or(gk.proj_scale_at_center).unwrap_or(1.0);
+    let k0 = gk
+        .proj_scale_at_nat_origin
+        .or(gk.proj_scale_at_center)
+        .unwrap_or(1.0);
     let sp1 = gk.proj_std_parallel1.unwrap_or(lat0);
     let sp2 = gk.proj_std_parallel2.unwrap_or(sp1);
 
@@ -242,7 +245,10 @@ pub(crate) fn wgs84_bounds(t: &Transform, crs: &Crs, w: u32, h: u32) -> Out<[f64
     let (mut w_, mut s, mut e, mut n) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
     for i in 0..=8 {
         let f = i as f64 / 8.0;
-        let (mx, my) = (t.origin_x + f * (x1 - t.origin_x), t.origin_y + f * (y1 - t.origin_y));
+        let (mx, my) = (
+            t.origin_x + f * (x1 - t.origin_x),
+            t.origin_y + f * (y1 - t.origin_y),
+        );
         for (px, py) in [(mx, t.origin_y), (mx, y1), (t.origin_x, my), (x1, my)] {
             if let Some((lon, lat)) = to_wgs.apply(px, py) {
                 (w_, s, e, n) = (w_.min(lon), s.min(lat), e.max(lon), n.max(lat));

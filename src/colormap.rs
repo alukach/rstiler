@@ -8,6 +8,8 @@
 
 type Stops = &'static [(u8, u8, u8, u8)];
 
+// Generated data, deliberately dense — one map per line reads as a table.
+#[rustfmt::skip]
 pub(crate) const BUILTIN: &[(&str, Stops)] = &[
     // viridis: 43 stops, max channel error 1
     ("viridis", &[(0,68,1,84), (6,70,10,93), (12,71,19,101), (18,72,27,109), (24,72,35,116), (30,71,42,122), (36,70,50,126), (42,68,57,131), (49,66,65,134), (55,63,72,137), (61,60,79,138), (67,57,85,140), (73,54,92,141), (79,51,98,141), (85,49,104,142), (91,46,110,142), (97,44,115,142), (103,41,121,142), (109,39,127,142), (115,37,132,142), (121,35,138,141), (128,33,145,140), (134,31,150,139), (140,30,156,137), (146,31,161,135), (152,34,167,133), (158,38,173,129), (164,45,178,125), (170,53,183,121), (176,63,188,115), (182,74,193,109), (188,86,198,103), (194,99,203,95), (200,112,207,87), (206,127,211,78), (212,142,214,69), (219,160,218,57), (225,176,221,47), (231,192,223,37), (237,208,225,28), (243,223,227,24), (249,239,229,28), (255,253,231,37)]),
@@ -49,7 +51,11 @@ impl Colormap {
                 let (p0, r0, g0, b0) = window[0];
                 let (p1, r1, g1, b1) = window[1];
                 let span = (p1 - p0) as f32;
-                let f = if span == 0.0 { 0.0 } else { (rescaled - p0) as f32 / span };
+                let f = if span == 0.0 {
+                    0.0
+                } else {
+                    (rescaled - p0) as f32 / span
+                };
                 let mix = |a: u8, b: u8| (a as f32 + f * (b as f32 - a as f32)).round() as u8;
                 Some([mix(r0, r1), mix(g0, g1), mix(b0, b1), 255])
             }
@@ -71,7 +77,10 @@ mod tests {
         for (name, stops) in BUILTIN {
             assert_eq!(stops[0].0, 0, "{name} must start at 0");
             assert_eq!(stops[stops.len() - 1].0, 255, "{name} must end at 255");
-            assert!(stops.windows(2).all(|w| w[0].0 < w[1].0), "{name} must ascend");
+            assert!(
+                stops.windows(2).all(|w| w[0].0 < w[1].0),
+                "{name} must ascend"
+            );
         }
     }
 
@@ -101,7 +110,11 @@ mod tests {
         t.insert(11, [70, 107, 159, 255]);
         let cm = Colormap::Discrete(t);
         assert_eq!(cm.lookup(0, 11.0), Some([70, 107, 159, 255]));
-        assert_eq!(cm.lookup(0, 11.4), Some([70, 107, 159, 255]), "rounds to nearest");
+        assert_eq!(
+            cm.lookup(0, 11.4),
+            Some([70, 107, 159, 255]),
+            "rounds to nearest"
+        );
         assert_eq!(cm.lookup(0, 12.0), None, "unmapped values stay transparent");
     }
 }

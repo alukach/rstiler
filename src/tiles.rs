@@ -8,19 +8,13 @@ use worker::*;
 
 use crate::cog::{decoders, nodata_of, Cog};
 use crate::fail::{Fail, Out};
+use crate::geo::{source_crs, transform_of, Reproject};
 use crate::query::Query;
-use crate::geo::{transform_of, source_crs, Reproject};
-use crate::render::{band_indices, colormap, png_response, rescale, resampling, sample};
+use crate::render::{band_indices, colormap, png_response, resampling, rescale, sample};
 use crate::tiling::{pick_overview, tile_bounds};
 use crate::{MAX_SOURCE_TILES, TILE};
 
-pub(crate) async fn tile(
-    src: &str,
-    z: &str,
-    x: &str,
-    y: &str,
-    q: &Query,
-) -> Out<Response> {
+pub(crate) async fn tile(src: &str, z: &str, x: &str, y: &str, q: &Query) -> Out<Response> {
     let parse = |s: &str, what: &str| -> Out<u32> {
         s.trim_end_matches(".png")
             .parse()
@@ -100,7 +94,9 @@ pub(crate) async fn tile(
         )));
     }
     if colormap.is_some() && bands.len() != 1 {
-        return Err(Fail::bad("a colormap needs exactly one band; pass bidx=<n>"));
+        return Err(Fail::bad(
+            "a colormap needs exactly one band; pass bidx=<n>",
+        ));
     }
     let (lo, hi) = rescale(q, bands.len())?;
     let how = resampling(q)?;

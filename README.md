@@ -281,6 +281,27 @@ The rest come from
 — the corpus `async-tiff` itself validates against — copied out under flat names
 grouped by what they exercise: `compress_*`, `bands_*`, `layout_*`, `crs_*`.
 
+## CI
+
+`.github/workflows/ci.yml` runs six jobs on every push and pull request, and
+`cargo audit` weekly on a schedule as well — advisories land without anyone
+pushing.
+
+| Job | What it guards |
+|---|---|
+| `lint` | `cargo fmt --check`, and `clippy -D warnings` against wasm32 |
+| `unit` | the dependency-free modules, via `fixtures/unit.sh` |
+| `build` | the wasm build, and reports bundle size to the run summary |
+| `integration` | `fixtures/check.py` and `fixtures/conformance.py` against a real `wrangler dev`, with GDAL installed as the reference |
+| `audit` | RustSec advisories against `Cargo.lock` |
+| `deploy` | `wrangler deploy`, on `main` only, and only when `CLOUDFLARE_API_TOKEN` is set |
+
+Everything is checked against `wasm32-unknown-unknown`, since that is the only
+target this ships to — linting a native build would check code we never run.
+
+Deploying is opt-in: a fork without the secret runs every check and stops
+before the deploy rather than failing on a missing token.
+
 ## Tests
 
 `fixtures/check.py` runs every fixture through `/cog/info`, `/cog/tilejson.json`
@@ -309,7 +330,10 @@ The pure-logic modules self-test without a wasm toolchain:
 
 ```
 python3 fixtures/conformance.py            # titiler's contract, 23 checks
-rustc --test src/tiling.rs   -o /tmp/t && /tmp/t
-rustc --test src/colormap.rs -o /tmp/c && /tmp/c
-rustc --test src/query.rs    -o /tmp/q && /tmp/q
+./fixtures/unit.sh                         # tiling, colormap, query
 ```
+
+`cargo test` cannot run those unit tests: the crate is a `cdylib` against
+`worker`, which only builds for wasm32, and there is no test harness for that
+target. Those modules deliberately depend on nothing, so `rustc --test` builds
+each as its own binary — which is all `unit.sh` does.

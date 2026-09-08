@@ -5,9 +5,9 @@ use worker::*;
 
 use crate::cog::{decoders, nodata_of, Cog, HttpReader};
 use crate::fail::{Fail, Out};
+use crate::geo::{source_crs, transform_of, wgs84_bounds, Crs, Reproject};
 use crate::query::Query;
 use crate::render::band_indices;
-use crate::geo::{source_crs, transform_of, wgs84_bounds, Crs, Reproject};
 use crate::render::sample;
 use crate::{tiling, STATS_TILES, TILE};
 
@@ -63,10 +63,7 @@ fn dtype(ifd: &ImageFileDirectory) -> String {
 fn nodata_type(ifd: &ImageFileDirectory) -> &'static str {
     if ifd.gdal_nodata().is_some() {
         "Nodata"
-    } else if ifd
-        .extra_samples()
-        .is_some_and(|e| !e.is_empty())
-    {
+    } else if ifd.extra_samples().is_some_and(|e| !e.is_empty()) {
         "Alpha"
     } else {
         "None"
@@ -156,7 +153,9 @@ async fn percentiles(
     let Some((ntx, nty)) = ifd.tile_count() else {
         return Ok(vec![]);
     };
-    let all: Vec<(usize, usize)> = (0..nty).flat_map(|y| (0..ntx).map(move |x| (x, y))).collect();
+    let all: Vec<(usize, usize)> = (0..nty)
+        .flat_map(|y| (0..ntx).map(move |x| (x, y)))
+        .collect();
     // Spread the sample across the image rather than taking a corner of it.
     let step = all.len().div_ceil(STATS_TILES).max(1);
     let coords: Vec<(usize, usize)> = all.into_iter().step_by(step).take(STATS_TILES).collect();
@@ -178,10 +177,10 @@ async fn percentiles(
         // the sort off the hot path on a full-resolution tile.
         for i in (0..data.len()).step_by(nb * 16) {
             examined += 1;
-            for b in 0..bands.min(nb) {
+            for (b, samples) in per_band.iter_mut().take(nb).enumerate() {
                 let v = sample(&data, i + b);
                 if v.is_finite() && nodata != Some(v) {
-                    per_band[b].push(v);
+                    samples.push(v);
                 }
             }
         }
@@ -225,7 +224,11 @@ async fn percentiles(
                 sum,
                 std: var.sqrt(),
                 median: at(0.5),
-                valid_percent: if examined == 0 { 0.0 } else { n / examined as f64 * 100.0 },
+                valid_percent: if examined == 0 {
+                    0.0
+                } else {
+                    n / examined as f64 * 100.0
+                },
                 masked_pixels: masked,
                 valid_pixels: n,
                 percentile_2: lo,

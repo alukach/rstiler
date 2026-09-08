@@ -20,6 +20,10 @@ TILER = os.environ.get("TILER", "http://127.0.0.1:8787")
 ORIGIN = os.environ.get("ORIGIN", "http://127.0.0.1:8099")
 HERE = pathlib.Path(__file__).parent
 
+if not (HERE / "synthetic_rgb_3857.tif").exists():
+    # The checks below run at import, so bail before firing 23 confusing ones.
+    sys.exit("no fixtures — run ./fixtures/setup.sh first")
+
 # The synthetic RGB scene, and a single-band Int16 one for colormap checks.
 RGB = urllib.parse.quote(f"{ORIGIN}/synthetic_rgb_3857.tif", safe="")
 DEM = urllib.parse.quote(f"{ORIGIN}/synthetic_dem_int16.tif", safe="")
@@ -263,9 +267,6 @@ def _():
 # ---------------------------------------------------------------- report
 
 if __name__ == "__main__":
-    if not (HERE / "synthetic_rgb_3857.tif").exists():
-        sys.exit("no fixtures — run ./fixtures/setup.sh first")
-
     failed = 0
     for status, name, cite, detail in results:
         if status == "ok":

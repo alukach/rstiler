@@ -1,6 +1,5 @@
 //! Turning decoded samples into an 8-bit RGBA PNG.
 
-
 use async_tiff::TypedArray;
 use worker::*;
 
@@ -37,7 +36,10 @@ pub(crate) fn colormap(q: &Query) -> Out<Option<Colormap>> {
             let key = k
                 .parse::<i64>()
                 .map_err(|_| Fail::bad(format!("colormap key {k:?} is not an integer")))?;
-            table.insert(key, parse_colour(&v).map_err(|e| Fail::bad(format!("colormap entry {k}: {e}")))?);
+            table.insert(
+                key,
+                parse_colour(&v).map_err(|e| Fail::bad(format!("colormap entry {k}: {e}")))?,
+            );
         }
         return Ok(Some(Colormap::Discrete(table)));
     }
@@ -76,7 +78,9 @@ fn parse_colour(v: &serde_json::Value) -> std::result::Result<[u8; 4], String> {
             if h.len() == 8 { byte(6)? } else { 255 },
         ]);
     }
-    let arr = v.as_array().ok_or("expected [r,g,b], [r,g,b,a] or \"#rrggbb\"")?;
+    let arr = v
+        .as_array()
+        .ok_or("expected [r,g,b], [r,g,b,a] or \"#rrggbb\"")?;
     let chan = |i: usize| -> std::result::Result<u8, String> {
         arr[i]
             .as_u64()
@@ -189,7 +193,11 @@ pub(crate) fn rescale(q: &Query, bands: usize) -> Out<(Vec<f64>, Vec<f64>)> {
                 lo.push(*a);
                 hi.push(*b);
             }
-            _ => return Err(Fail::bad(format!("rescale {p:?} must be min,max with max > min"))),
+            _ => {
+                return Err(Fail::bad(format!(
+                    "rescale {p:?} must be min,max with max > min"
+                )))
+            }
         }
     }
     if given.len() == 1 {
