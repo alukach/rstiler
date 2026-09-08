@@ -144,16 +144,33 @@ Two changes follow from that, both shipped:
 | `/cog/info` computing percentiles | always | moved to `/cog/statistics` |
 
 A 1 MiB initial readahead collapses the whole IFD walk into a *single* range
-read, and `HttpReader` caches each `(url, range)` in the Workers Cache API, so
-every later request for the same COG header is edge-local.
+read on most COGs, and `HttpReader` caches each `(url, range)` in the Workers
+Cache API, so every later request for the same COG header is edge-local.
+
+Rendered tiles are cached too, which matters more than it first looks. A COG
+with a deep pyramid carries a lot of metadata — a 463832 × 102252 raster has
+181,200 tile offsets at full resolution alone, ~3.7 MiB of tag arrays across
+the chain — and we parse all of it to serve one overview level. That is ~100 ms
+of CPU on every tile even when every source byte is already cached. Caching the
+PNG skips it:
+
+| | first | cached |
+|---|---|---|
+| tile, deep-pyramid COG | 0.10 – 1.1 s | **~3 ms** |
+
+The tile cache is keyed by crate version, so a release that changes rendering
+does not serve pixels drawn by the previous one.
 
 Rendering itself was never the problem — reprojection, resampling and PNG
 encoding total 17–77 ms per tile.
 
 ### Next, in order of value
 
-1. **ETag revalidation on the byte-range cache.** It is time-based today, so a
-   COG overwritten in place under the same URL serves stale bytes for a day.
+1. **ETag revalidation on the caches.** Both are time-based today, so a COG
+   overwritten in place under the same URL serves stale bytes for a day.
+2. **Lazy IFD parsing.** We parse the whole chain to pick one overview level;
+   on a large COG that is megabytes of tile offsets and ~100 ms of CPU per
+   uncached tile. Only the chosen level's arrays are actually needed.
 3. **`/cog/preview` and `/cog/bbox`** — both fall out of generalising the tile
    pipeline to render an arbitrary window at an arbitrary size, which is worth
    doing on its own.

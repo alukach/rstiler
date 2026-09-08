@@ -53,7 +53,26 @@ async fn fetch(req: Request, _env: Env, _ctx: Context) -> Result<Response> {
         return Response::error("missing required `url` query parameter", 400);
     };
 
-    let out = match path.split('/').collect::<Vec<_>>().as_slice() {
+    let parts: Vec<&str> = path.split('/').collect();
+
+    // A rendered tile is a pure function of its URL, and rendering one costs a
+    // metadata parse even when every source byte is already cached — a COG with
+    // a deep pyramid carries megabytes of tile offsets. Cache the PNG itself so
+    // a second viewer of the same tile pays neither.
+    let is_tile = matches!(parts.as_slice(), ["cog", "tiles", ..]);
+    let cache = Cache::default();
+    // Keyed by version so a release that changes rendering does not serve
+    // tiles drawn by the previous one.
+    // ponytail: bump the crate version when you change how pixels are made, or
+    // pass a cache-buster (fixtures/check.py does) while iterating locally.
+    let key = format!("{url}#v{}", env!("CARGO_PKG_VERSION"));
+    if is_tile {
+        if let Ok(Some(hit)) = cache.get(&key, true).await {
+            return Ok(hit);
+        }
+    }
+
+    let out = match parts.as_slice() {
         ["cog", "info"] => info(&src).await,
         ["cog", "tilejson.json"] => tilejson(&src, &url).await,
         ["cog", "tiles", z, x, y] => tile(&src, z, x, y, &q).await,
@@ -63,7 +82,14 @@ async fn fetch(req: Request, _env: Env, _ctx: Context) -> Result<Response> {
     };
 
     match out {
-        Ok(resp) => Ok(resp),
+        Ok(mut resp) => {
+            if is_tile {
+                if let Ok(copy) = resp.cloned() {
+                    let _ = cache.put(&key, copy).await;
+                }
+            }
+            Ok(resp)
+        }
         // JSON, so the viewer can show the message rather than a bare status.
         Err(e) => Response::from_json(&serde_json::json!({ "detail": format!("{e}") }))
             .map(|r| r.with_status(500)),

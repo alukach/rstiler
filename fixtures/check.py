@@ -32,7 +32,14 @@ ALL_NODATA = {
 }
 
 
+# The Worker caches rendered tiles, so the gate has to opt out or it would
+# happily test pixels drawn by a previous build.
+BUST = f"&_nocache={os.getpid()}"
+
+
 def curl(path, out="/tmp/check_body.bin", timeout=120):
+    if "/cog/tiles/" in path:
+        path += BUST
     code = subprocess.run(
         ["curl", "-s", "--max-time", str(timeout), "-o", out, "-w", "%{http_code}",
          TILER + path], capture_output=True, text=True).stdout.strip()
