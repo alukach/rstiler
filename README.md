@@ -1,7 +1,10 @@
-# cf-geotiff-tileserver
+# rstiler
 
 A prototype of [titiler](https://github.com/developmentseed/titiler), written in
-Rust and running on Cloudflare Workers. COGs are read over HTTP range requests
+Rust and running on Cloudflare Workers. `rs` for Rust, and because r-s-t: it is
+the one that comes just before titiler.
+
+COGs are read over HTTP range requests
 with [`async-tiff`](https://github.com/developmentseed/async-tiff), reprojected
 to Web Mercator with [`proj4rs`](https://github.com/3liz/proj4rs), and encoded
 to PNG — all inside the Worker, no GDAL, no Python.
