@@ -4,7 +4,9 @@
 
 mod cog;
 mod colormap;
+mod expression;
 mod fail;
+mod gdalmeta;
 mod geo;
 mod lazyifd;
 mod meta;
@@ -18,6 +20,57 @@ use worker::*;
 
 use fail::{Fail, Out};
 use query::Query;
+
+/// Parameters every endpoint takes.
+const COMMON: &[&str] = &["url"];
+/// Parameters that shape a rendered tile.
+const RENDER: &[&str] = &[
+    "url",
+    "bidx",
+    "expression",
+    "rescale",
+    "colormap",
+    "colormap_name",
+    "resampling",
+    "nodata",
+    "unscale",
+    "return_mask",
+    "tilesize",
+];
+/// What `/cog/tilejson.json` accepts: it copies the query into the tile URLs.
+const TILEJSON: &[&str] = &[
+    "url",
+    "bidx",
+    "expression",
+    "rescale",
+    "colormap",
+    "colormap_name",
+    "resampling",
+    "nodata",
+    "unscale",
+    "return_mask",
+    "tilesize",
+    "minzoom",
+    "maxzoom",
+];
+/// What `/cog/point` accepts.
+const POINT: &[&str] = &["url", "bidx", "nodata", "coord_crs", "unscale"];
+/// titiler parameters this server does not implement. Named separately so the
+/// error can say "not implemented" rather than "unknown", which is the
+/// difference between a gap and a typo.
+const UNIMPLEMENTED: &[&str] = &[
+    "color_formula",
+    "buffer",
+    "padding",
+    "algorithm",
+    "algorithm_params",
+    "dst_crs",
+    "tileMatrixSetId",
+    "max_size",
+    "width",
+    "height",
+    "format",
+];
 
 use meta::{info, point, statistics, tilejson};
 use tiles::tile;
@@ -66,7 +119,16 @@ async fn fetch(req: Request, _env: Env, _ctx: Context) -> Result<Response> {
     let is_tile = matches!(parts.as_slice(), ["cog", "tiles", ..]);
     let cache = Cache::default();
     let key = format!("{url}#v{}", env!("CARGO_PKG_VERSION"));
-    if is_tile {
+    // Standard HTTP: a client asking for no-cache gets a fresh render. This is
+    // also how the test harness avoids grading a previous build's pixels,
+    // without a bypass parameter that would itself have to be allowed through.
+    let fresh = req
+        .headers()
+        .get("Cache-Control")
+        .ok()
+        .flatten()
+        .is_some_and(|v| v.to_ascii_lowercase().contains("no-cache"));
+    if is_tile && !fresh {
         if let Ok(Some(hit)) = cache.get(&key, true).await {
             return Ok(hit);
         }
@@ -97,6 +159,18 @@ async fn route(parts: &[&str], url: &Url, q: &Query) -> Out<Response> {
         .last("url")
         .ok_or_else(|| Fail::bad("missing required `url` query parameter"))?
         .to_string();
+
+    // Refuse a parameter we do not honour rather than ignore it. A client that
+    // asked for something and got a tile anyway cannot tell it was dropped.
+    let known: &[&str] = match parts {
+        ["cog", "tiles", ..] => RENDER,
+        // tilejson copies the query into the tile URLs it hands out, so it has
+        // to accept everything a tile does.
+        ["cog", "tilejson.json"] => TILEJSON,
+        ["cog", "point", _] => POINT,
+        _ => COMMON,
+    };
+    q.reject_unknown(known, UNIMPLEMENTED).map_err(Fail::bad)?;
 
     match parts {
         ["cog", "info"] => info(&src, q).await,

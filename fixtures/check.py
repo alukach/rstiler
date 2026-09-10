@@ -40,16 +40,17 @@ ALL_NODATA = {
 
 
 # The Worker caches rendered tiles, so the gate has to opt out or it would
-# happily test pixels drawn by a previous build.
-BUST = f"&_nocache={os.getpid()}"
+# happily test pixels drawn by a previous build. Cache-Control is the standard
+# way to say so, and it keeps the server from having to allow a bypass
+# parameter that every other unknown parameter is refused for.
+NO_CACHE = ["-H", "Cache-Control: no-cache"]
 
 
 def curl(path, out="/tmp/check_body.bin", timeout=120):
-    if "/cog/tiles/" in path:
-        path += BUST
     code = subprocess.run(
-        ["curl", "-s", "--max-time", str(timeout), "-o", out, "-w", "%{http_code}",
-         TILER + path], capture_output=True, text=True, check=False).stdout.strip()
+        ["curl", "-s", "--max-time", str(timeout), *NO_CACHE, "-o", out,
+         "-w", "%{http_code}", TILER + path],
+        capture_output=True, text=True, check=False).stdout.strip()
     return code, pathlib.Path(out)
 
 
@@ -200,7 +201,8 @@ def assertions():
         curl(f"/cog/tiles/{Z}/{X}/{Y}.png?url={url_for(name + '.tif')}", "/tmp/w.png")
         if subprocess.run(["gdalwarp", "-q", "-overwrite", "-t_srs", "EPSG:3857", "-te",
                            *map(str, te), "-ts", "256", "256", "-r", "near",
-                           str(HERE / f"{name}.tif"), "/tmp/wref.tif"]).returncode == 0:
+                           str(HERE / f"{name}.tif"), "/tmp/wref.tif"],
+                          check=False).returncode == 0:
             subprocess.run(["gdal_translate", "-q", "-of", "PNG", "-b", "1", "-b", "2",
                             "-b", "3", "/tmp/wref.tif", "/tmp/wref.png"], check=True)
             n_diff = differing("/tmp/w.png", "/tmp/wref.png")

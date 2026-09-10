@@ -50,6 +50,44 @@ impl Query {
     }
 }
 
+impl Query {
+    /// Reject any parameter this endpoint does not implement.
+    ///
+    /// Silently ignoring one is the worst failure mode available to us: a
+    /// client that asks for `expression=(b8-b4)/(b8+b4)` and gets a plausible
+    /// tile back has no way to notice it received raw band 1 instead. Failing
+    /// loudly is the only honest answer while the parameter is unimplemented.
+    ///
+    /// `known` is what the endpoint accepts; `unimplemented` is what titiler
+    /// accepts and we do not, named separately so the error can say which is
+    /// which.
+    pub(crate) fn reject_unknown(
+        &self,
+        known: &[&str],
+        unimplemented: &[&str],
+    ) -> std::result::Result<(), String> {
+        for (k, _) in &self.0 {
+            if known.contains(&k.as_str()) {
+                continue;
+            }
+            if unimplemented.contains(&k.as_str()) {
+                return Err(format!(
+                    "`{k}` is a titiler parameter this server has not implemented. \
+                     It is refused rather than ignored, so a tile is never quietly \
+                     different from what was asked for."
+                ));
+            }
+            let mut names: Vec<&str> = known.to_vec();
+            names.sort_unstable();
+            return Err(format!(
+                "unknown parameter `{k}`; this endpoint accepts: {}",
+                names.join(", ")
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,6 +117,32 @@ mod tests {
         assert_eq!(q("a=&a=7").last("a"), Some("7"));
         assert_eq!(q("a=").last("a"), None);
         assert_eq!(q("").last("a"), None);
+    }
+
+    #[test]
+    fn unknown_parameters_are_named_in_the_error() {
+        let q = q("url=x&nope=1");
+        let e = q.reject_unknown(&["url", "bidx"], &[]).unwrap_err();
+        assert!(e.contains("nope"), "{e}");
+        assert!(e.contains("bidx"), "should list what is accepted: {e}");
+    }
+
+    #[test]
+    fn unimplemented_parameters_say_so_rather_than_being_ignored() {
+        let q = q("url=x&expression=b1*2");
+        let e = q.reject_unknown(&["url"], &["expression"]).unwrap_err();
+        assert!(
+            e.contains("not implemented") || e.contains("has not implemented"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn known_parameters_pass() {
+        assert!(q("url=x&bidx=1&bidx=2")
+            .reject_unknown(&["url", "bidx"], &[])
+            .is_ok());
+        assert!(q("").reject_unknown(&["url"], &[]).is_ok());
     }
 
     #[test]
