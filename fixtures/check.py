@@ -28,7 +28,6 @@ HERE = pathlib.Path(__file__).parent
 KNOWN_GAPS = {
     "compress_lerc.tif":        "LERC decoder is C (lerc-sys); needs a wasm libc",
     "compress_jpegxl.tif":      "async-tiff has no JPEG-XL decoder",
-    "layout_planar.tif":        "PlanarConfiguration=2 band reassembly",
     "layout_stripped.tif":      "stripped (non-tiled) TIFFs",
     "layout_bigtiff_subifd.tif": "SubIFD pyramid carries no ModelPixelScale",
     "crs_rotated_sar.tif":      "ModelTransformation instead of ModelPixelScale",

@@ -31,11 +31,6 @@ pub(crate) async fn tile(src: &str, z: &str, x: &str, y: &str, q: &Query) -> Out
     let t = transform_of(base)?;
     let reproject = Reproject::new(&source_crs(base)?)?;
 
-    if base.planar_configuration() != PlanarConfiguration::Chunky {
-        // ponytail: planar TIFFs are rare in the wild; add band-plane
-        // reassembly here if one shows up.
-        return Err(Fail::bad("planar TIFFs not supported"));
-    }
 
     let (xmin, ymin, xmax, ymax) = tile_bounds(z, x, y);
     let blank = || png_response(&vec![0u8; TILE * TILE * 4]);
@@ -160,14 +155,18 @@ pub(crate) async fn tile(src: &str, z: &str, x: &str, y: &str, q: &Query) -> Out
     let t_fetch = Date::now().as_millis() - t1;
     let t2 = Date::now().as_millis();
 
-    let mut chunks: HashMap<(usize, usize), (TypedArray, usize)> = HashMap::new();
+    // async-tiff decodes both layouts; they differ only in how the samples are
+    // ordered. Chunky interleaves them per pixel and is shaped (h, w, bands);
+    // planar stores one full plane per band and is shaped (bands, h, w).
+    let planar = base.planar_configuration() == PlanarConfiguration::Planar;
+    let mut chunks: HashMap<(usize, usize), (TypedArray, [usize; 3])> = HashMap::new();
     for tile in fetched {
         let (cx, cy) = (tile.x(), tile.y());
         let arr = tile
             .decode(&decoders())
             .map_err(|e| Fail::bad(format!("decode failed: {e}")))?;
-        let nb = arr.shape()[2];
-        chunks.insert((cx, cy), (arr.into_inner().0, nb));
+        let shape = arr.shape();
+        chunks.insert((cx, cy), (arr.into_inner().0, shape));
     }
 
     // Nearest-neighbour resample into the output tile.
@@ -176,8 +175,17 @@ pub(crate) async fn tile(src: &str, z: &str, x: &str, y: &str, q: &Query) -> Out
     // One source sample, or None when it is outside the image, in an unfetched
     // chunk, or nodata.
     let at_px = |sx: usize, sy: usize, band: usize| -> Option<f64> {
-        let (data, nb) = chunks.get(&(sx / tw, sy / th))?;
-        let v = sample(data, ((sy % th) * tw + (sx % tw)) * nb + band);
+        let (data, shape) = chunks.get(&(sx / tw, sy / th))?;
+        let (x, y) = (sx % tw, sy % th);
+        let i = if planar {
+            // (bands, h, w): whole plane per band.
+            let (h, w) = (shape[1], shape[2]);
+            band * h * w + y * w + x
+        } else {
+            // (h, w, bands): samples interleaved per pixel.
+            (y * shape[1] + x) * shape[2] + band
+        };
+        let v = sample(data, i);
         (v.is_finite() && nodata != Some(v)).then_some(v)
     };
 
