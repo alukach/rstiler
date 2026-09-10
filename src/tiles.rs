@@ -7,13 +7,18 @@ use async_tiff::TypedArray;
 use worker::*;
 
 use crate::cog::{decoders, nodata_of, Cog};
+use crate::expression::{parse_all, Expr};
 use crate::fail::{Fail, Out};
+use crate::gdalmeta::scaling;
 use crate::geo::{source_crs, transform_of, Reproject};
 use crate::query::Query;
 use crate::render::{band_indices, colormap, png_response, resampling, rescale, sample};
 use crate::tiling::{pick_overview, tile_bounds};
 use crate::warp::Warp;
 use crate::{MAX_SOURCE_TILES, TILE};
+
+/// Most source bands one pixel read can carry.
+const MAX_BANDS: usize = 32;
 
 pub(crate) async fn tile(src: &str, z: &str, x: &str, y: &str, q: &Query) -> Out<Response> {
     let parse = |s: &str, what: &str| -> Out<u32> {
@@ -23,6 +28,21 @@ pub(crate) async fn tile(src: &str, z: &str, x: &str, y: &str, q: &Query) -> Out
     };
     let (z, x, y) = (parse(z, "z")?, parse(x, "x")?, parse(y, "y")?);
 
+    // titiler's `tilesize`. Bounded because the whole render is one Worker's
+    // CPU budget, and it grows with the square of this.
+    let size = match q.last("tilesize") {
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|s| (64..=1024).contains(s) && s % 16 == 0)
+            .ok_or_else(|| {
+                Fail::bad(format!(
+                    "tilesize {v:?} must be a multiple of 16 between 64 and 1024"
+                ))
+            })?,
+        None => TILE,
+    };
+
     let t0 = Date::now().as_millis();
     let cog = Cog::open(src).await?;
     let t_meta = Date::now().as_millis() - t0;
@@ -31,15 +51,14 @@ pub(crate) async fn tile(src: &str, z: &str, x: &str, y: &str, q: &Query) -> Out
     let t = transform_of(base)?;
     let reproject = Reproject::new(&source_crs(base)?)?;
 
-
     let (xmin, ymin, xmax, ymax) = tile_bounds(z, x, y);
-    let blank = || png_response(&vec![0u8; TILE * TILE * 4]);
+    let blank = || png_response(&vec![0u8; size * size * 4], size, true);
 
     // Source-CRS coordinate for an output pixel centre.
     let at = |ox: f64, oy: f64| {
         reproject.apply(
-            xmin + (ox + 0.5) * (xmax - xmin) / TILE as f64,
-            ymax - (oy + 0.5) * (ymax - ymin) / TILE as f64,
+            xmin + (ox + 0.5) * (xmax - xmin) / size as f64,
+            ymax - (oy + 0.5) * (ymax - ymin) / size as f64,
         )
     };
 
@@ -50,8 +69,8 @@ pub(crate) async fn tile(src: &str, z: &str, x: &str, y: &str, q: &Query) -> Out
     for i in 0..=PROBE {
         for j in 0..=PROBE {
             let (ox, oy) = (
-                i as f64 * TILE as f64 / PROBE as f64,
-                j as f64 * TILE as f64 / PROBE as f64,
+                i as f64 * size as f64 / PROBE as f64,
+                j as f64 * size as f64 / PROBE as f64,
             );
             if let Some(p) = at(ox, oy) {
                 probes.push(p);
@@ -71,7 +90,7 @@ pub(crate) async fn tile(src: &str, z: &str, x: &str, y: &str, q: &Query) -> Out
     );
 
     // Resolution the output needs, expressed in the source CRS's own units.
-    let target_res = ((wx1 - wx0) / TILE as f64).max((wy1 - wy0) / TILE as f64);
+    let target_res = ((wx1 - wx0) / size as f64).max((wy1 - wy0) / size as f64);
     let widths: Vec<u32> = ifds.iter().map(|i| i.image_width()).collect();
     let level = pick_overview(&widths, t.res_x, target_res);
     let scale = widths[0] as f64 / widths[level] as f64;
@@ -81,27 +100,81 @@ pub(crate) async fn tile(src: &str, z: &str, x: &str, y: &str, q: &Query) -> Out
     let ifd = &chosen.ifds()[0];
 
     let colormap = colormap(q)?;
-    let bands = band_indices(q, ifd.samples_per_pixel() as usize)?;
-    // A PNG is grey or RGB, so a tile can only be drawn from 1 or 3 bands.
-    if !matches!(bands.len(), 1 | 3) {
+    let sample_count = ifd.samples_per_pixel() as usize;
+    if sample_count > MAX_BANDS {
         return Err(Fail::bad(format!(
-            "bidx names {} bands; a tile needs 1 or 3",
-            bands.len()
+            "{sample_count} bands; this server reads at most {MAX_BANDS}"
         )));
     }
-    if colormap.is_some() && bands.len() != 1 {
+
+    // `expression` replaces `bidx`: it names its own bands and produces one
+    // output per expression.
+    let exprs: Option<Vec<Expr>> = match q.last("expression") {
+        Some(src) => {
+            if q.last("bidx").is_some() {
+                return Err(Fail::bad("pass either bidx or expression, not both"));
+            }
+            let parsed = parse_all(src).map_err(Fail::bad)?;
+            for e in &parsed {
+                if e.max_band() > sample_count {
+                    return Err(Fail::bad(format!(
+                        "expression reads b{} but the dataset has {sample_count} bands",
+                        e.max_band()
+                    )));
+                }
+            }
+            Some(parsed)
+        }
+        None => None,
+    };
+
+    // Which source bands have to be read, and how many values come out.
+    let (bands, outputs) = match &exprs {
+        // Every band the expressions might touch.
+        Some(e) => ((0..sample_count).collect::<Vec<_>>(), e.len()),
+        None => {
+            let b = band_indices(q, sample_count)?;
+            let n = b.len();
+            (b, n)
+        }
+    };
+
+    // A PNG is grey or RGB, so a tile can only be drawn from 1 or 3 values.
+    if !matches!(outputs, 1 | 3) {
+        return Err(Fail::bad(format!(
+            "{} produces {outputs} bands; a tile needs 1 or 3",
+            if exprs.is_some() {
+                "expression"
+            } else {
+                "bidx"
+            }
+        )));
+    }
+    if colormap.is_some() && outputs != 1 {
         return Err(Fail::bad(
-            "a colormap needs exactly one band; pass bidx=<n>",
+            "a colormap needs exactly one band; pass bidx=<n> or a single expression",
         ));
     }
-    let (lo, hi) = rescale(q, bands.len())?;
+    let (lo, hi) = rescale(q, outputs)?;
+
+    // `unscale` applies the dataset's own scale/offset, which GDAL keeps in
+    // its metadata XML rather than in a TIFF field.
+    let unscale = matches!(q.last("unscale"), Some("true" | "1" | "yes"));
+    let scaling = if unscale {
+        scaling(ifd.gdal_metadata(), sample_count)
+    } else {
+        Vec::new()
+    };
+
+    // titiler's `return_mask=false` drops the alpha band from the output.
+    let with_alpha = !matches!(q.last("return_mask"), Some("false" | "0" | "no"));
     let how = resampling(q)?;
     // titiler lets a request override the dataset's own nodata.
     let nodata = match q.last("nodata") {
         Some(s) => Some(
             s.trim()
                 .parse::<f64>()
-                .map_err(|_| Error::RustError(format!("nodata {s:?} is not a number")))?,
+                .map_err(|_| Fail::bad(format!("nodata {s:?} is not a number")))?,
         ),
         None => nodata_of(ifd),
     };
@@ -110,7 +183,7 @@ pub(crate) async fn tile(src: &str, z: &str, x: &str, y: &str, q: &Query) -> Out
     let warp = Warp::new(
         &reproject,
         (xmin, ymin, xmax, ymax),
-        TILE,
+        size,
         t.res_x.min(t.res_y) * scale,
     );
 
@@ -189,9 +262,9 @@ pub(crate) async fn tile(src: &str, z: &str, x: &str, y: &str, q: &Query) -> Out
         (v.is_finite() && nodata != Some(v)).then_some(v)
     };
 
-    let mut rgba = vec![0u8; TILE * TILE * 4];
-    for oy in 0..TILE {
-        for ox in 0..TILE {
+    let mut rgba = vec![0u8; size * size * 4];
+    for oy in 0..size {
+        for ox in 0..size {
             let Some((wx, wy)) = warp.at(ox as f64, oy as f64) else {
                 continue;
             };
@@ -200,15 +273,40 @@ pub(crate) async fn tile(src: &str, z: &str, x: &str, y: &str, q: &Query) -> Out
                 continue;
             }
 
-            let o = (oy * TILE + ox) * 4;
-            let mut raw = [0.0f64; 3];
-            let mut eight = [0u8; 3];
+            let o = (oy * size + ox) * 4;
+
+            // Read every band this pixel needs, applying the dataset's own
+            // scale/offset first if asked.
+            let mut read = [0.0f64; MAX_BANDS];
             let mut valid = true;
-            for (c, b) in bands.iter().enumerate() {
+            for (slot, b) in bands.iter().enumerate() {
                 let Some(v) = how.sample(fx, fy, iw, ih, |x, y| at_px(x, y, *b)) else {
                     valid = false;
                     break;
                 };
+                read[slot] = match scaling.get(*b) {
+                    Some(s) if !s.is_identity() => s.apply(v),
+                    _ => v,
+                };
+            }
+            if !valid {
+                continue;
+            }
+
+            // An expression names bands 1-based across the whole dataset, so
+            // it reads `read` directly; bidx already selected its bands.
+            let mut raw = [0.0f64; 3];
+            let mut eight = [0u8; 3];
+            for c in 0..outputs {
+                let v = match &exprs {
+                    Some(e) => e[c].eval(&read[..bands.len()]),
+                    None => read[c],
+                };
+                // An expression can divide by zero; that pixel is nodata.
+                if !v.is_finite() {
+                    valid = false;
+                    break;
+                }
                 let (l, h) = (lo[c], hi[c]);
                 raw[c] = v;
                 eight[c] = (((v - l) / (h - l)).clamp(0.0, 1.0) * 255.0) as u8;
@@ -224,7 +322,7 @@ pub(crate) async fn tile(src: &str, z: &str, x: &str, y: &str, q: &Query) -> Out
                 },
                 None => {
                     rgba[o..o + 3].copy_from_slice(&eight);
-                    if bands.len() == 1 {
+                    if outputs == 1 {
                         rgba[o + 1] = eight[0];
                         rgba[o + 2] = eight[0];
                     }
@@ -249,7 +347,7 @@ pub(crate) async fn tile(src: &str, z: &str, x: &str, y: &str, q: &Query) -> Out
         reqs - hits,
         bytes / 1024
     );
-    let mut resp = png_response(&rgba)?;
+    let mut resp = png_response(&rgba, size, with_alpha)?;
     let _ = resp.headers_mut().set("Server-Timing", &timing);
     Ok(resp)
 }

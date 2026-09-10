@@ -15,8 +15,10 @@ reported, not failed — that list is the conformance gap, and it shrinks by
 deleting entries, never by weakening an assertion.
 """
 import json
+import math
 import os
 import pathlib
+import struct
 import subprocess
 import sys
 import urllib.parse
@@ -32,21 +34,22 @@ if not (HERE / "synthetic_rgb_3857.tif").exists():
 # The synthetic RGB scene, and a single-band Int16 one for colormap checks.
 RGB = urllib.parse.quote(f"{ORIGIN}/synthetic_rgb_3857.tif", safe="")
 DEM = urllib.parse.quote(f"{ORIGIN}/synthetic_dem_int16.tif", safe="")
+SCALED = urllib.parse.quote(f"{ORIGIN}/bands_scale_offset.tif", safe="")
 
 # A tile with data in it, and the WGS84 point at its centre.
 Z, X, Y = 12, 1204, 1539
 LON, LAT = -73.93, 40.80
+# bands_scale_offset.tif sits near 0,0 and is only 1.28 degrees across.
+SZ, SX, SY = 7, 64, 64
 
 # titiler behaviour we have not built. Each entry is reported, not run.
 UNIMPLEMENTED = {
-    "expression": "band math",
     "output formats": "jpeg, webp, tif, npy — we serve png only",
-    "return_mask": "mask band in the output",
-    "coord_crs / dst_crs": "point and tile CRS overrides",
+    "dst_crs": "rendering a tile into a CRS other than Web Mercator",
     "tileMatrixSetId in path": "WebMercatorQuad is assumed, not selected",
     "info.geojson": "GeoJSON info, incl. MultiPolygon across the antimeridian",
     "preview / bbox / feature": "arbitrary-window rendering",
-    "colormap intervals": "[([min,max],[r,g,b,a]), ...] form",
+
     "algorithm": "post-processing hooks",
     "histogram / majority / minority / unique": "in /statistics",
 }
@@ -75,7 +78,11 @@ def get(path):
     out = "/tmp/conf_body.bin"
     hdr = "/tmp/conf_head.txt"
     code = subprocess.run(
-        ["curl", "-s", "--max-time", "120", "-o", out, "-D", hdr, "-w", "%{http_code}",
+        ["curl", "-s", "--max-time", "120",
+         # The Worker caches rendered tiles; without this the suite would grade
+         # a response produced by an earlier build with different rules.
+         "-H", "Cache-Control: no-cache",
+         "-o", out, "-D", hdr, "-w", "%{http_code}",
          TILER + path], capture_output=True, text=True, check=False).stdout.strip()
     headers = {}
     for line in pathlib.Path(hdr).read_text(errors="replace").splitlines():
@@ -87,6 +94,15 @@ def get(path):
 
 def js(body):
     return json.loads(body.decode(errors="replace"))
+
+
+def png_size(body):
+    """(width, height) from the IHDR, without decoding the image."""
+    return struct.unpack(">II", body[16:24])
+
+
+def png_channels(body):
+    return {0: 1, 2: 3, 4: 2, 6: 4}[body[25]]
 
 
 # ---------------------------------------------------------------- tilejson
@@ -248,6 +264,115 @@ def _():
 def _():
     _, _, body = get(f"/cog/statistics?url={RGB}")
     assert js(body)["b1"]["description"] == "b1", js(body)["b1"].get("description")
+
+
+# ---------------------------------------------------------------- parameters we refuse
+
+@check("unknown parameter -> 400", "silently ignoring one is worse than failing")
+def _():
+    code, _, body = get(f"/cog/tiles/{Z}/{X}/{Y}.png?url={RGB}&notaparam=1")
+    assert code == 400, f"got {code}"
+    assert "notaparam" in body.decode(errors="replace"), "should name the offender"
+
+
+@check("unimplemented titiler parameter -> 400, not ignored", "titiler honours these")
+def _():
+    for p in ("buffer=16", "color_formula=gamma%20RGB%203", "algorithm=hillshade"):
+        code, _, body = get(f"/cog/tiles/{Z}/{X}/{Y}.png?url={RGB}&{p}")
+        assert code == 400, f"{p}: got {code}"
+        d = body.decode(errors="replace")
+        assert "implement" in d, f"{p}: should say it is unimplemented, got {d[:80]}"
+
+
+# ---------------------------------------------------------------- expression
+
+@check("expression: b1;b2;b3 equals bidx, b3;b2;b1 does not", "test_TilerFactory")
+def _():
+    plain = get(f"/cog/tiles/{Z}/{X}/{Y}.png?url={RGB}&bidx=1&bidx=2&bidx=3")
+    same = get(f"/cog/tiles/{Z}/{X}/{Y}.png?url={RGB}&expression=b1;b2;b3")
+    flipped = get(f"/cog/tiles/{Z}/{X}/{Y}.png?url={RGB}&expression=b3;b2;b1")
+    assert plain[0] == same[0] == flipped[0] == 200, "all three should render"
+    assert plain[2] == same[2], "b1;b2;b3 should match the plain band selection"
+    # Without this the check passes when expression is ignored entirely.
+    assert plain[2] != flipped[2], "reversing the bands must change the output"
+
+
+@check("expression: arithmetic changes the pixels", "test_TilerFactory")
+def _():
+    plain = get(f"/cog/tiles/{Z}/{X}/{Y}.png?url={RGB}&bidx=1&rescale=0,255")
+    e = urllib.parse.quote("b1/2", safe="")
+    half = get(f"/cog/tiles/{Z}/{X}/{Y}.png?url={RGB}&expression={e}&rescale=0,255")
+    assert half[0] == 200, f"got {half[0]}"
+    assert plain[2] != half[2], "b1/2 must differ from b1"
+
+
+@check("expression: nonsense -> 400", "bad input is a client error")
+def _():
+    code, _, _ = get(f"/cog/tiles/{Z}/{X}/{Y}.png?url={RGB}&expression=b1%20%2B")
+    assert code == 400, f"got {code}"
+
+
+@check("expression: band out of range -> 400", "titiler validates against the dataset")
+def _():
+    code, _, _ = get(f"/cog/tiles/{Z}/{X}/{Y}.png?url={RGB}&expression=b9")
+    assert code == 400, f"got {code}"
+
+
+# ---------------------------------------------------------------- more render params
+
+@check("tilesize: 512 returns a 512px tile", "test_TilerFactory")
+def _():
+    code, _, body = get(f"/cog/tiles/{Z}/{X}/{Y}.png?url={RGB}&tilesize=512")
+    assert code == 200, f"got {code}"
+    w, h = png_size(body)
+    assert (w, h) == (512, 512), f"got {w}x{h}"
+
+
+@check("return_mask=false drops the alpha band", "test_TilerFactory")
+def _():
+    code, _, body = get(f"/cog/tiles/{Z}/{X}/{Y}.png?url={RGB}&return_mask=false")
+    assert code == 200, f"got {code}"
+    assert png_channels(body) == 3, f"expected RGB, got {png_channels(body)} channels"
+
+
+@check("unscale changes the pixels on a scaled dataset", "test_TilerFactory")
+def _():
+    # bands_scale_offset.tif carries a scale/offset; applying it must move the
+    # values, otherwise the parameter is being ignored.
+    raw = get(f"/cog/tiles/{SZ}/{SX}/{SY}.png?url={SCALED}&rescale=0,3000")
+    un = get(f"/cog/tiles/{SZ}/{SX}/{SY}.png?url={SCALED}&unscale=true&rescale=0,3000")
+    assert un[0] == 200, f"got {un[0]}"
+    assert raw[2] != un[2], "unscale must change the rendered values"
+
+
+@check("point: coord_crs reads the coordinate in another CRS", "test_TilerFactory")
+def _():
+    # The same ground point, given in Web Mercator instead of WGS84. Compute
+    # the projection rather than hardcoding it: a rounded constant lands on a
+    # neighbouring pixel and the check then fails for the wrong reason.
+    r = 6378137.0
+    mx = math.radians(LON) * r
+    my = math.log(math.tan(math.pi / 4 + math.radians(LAT) / 2)) * r
+    a = get(f"/cog/point/{LON},{LAT}?url={RGB}")
+    b = get(f"/cog/point/{mx},{my}?url={RGB}&coord_crs=EPSG:3857")
+    assert b[0] == 200, f"got {b[0]}: {b[2][:120]}"
+    assert js(a[2])["pixel"] == js(b[2])["pixel"], (
+        f"same ground point should be the same pixel: "
+        f"{js(a[2])['pixel']} vs {js(b[2])['pixel']}"
+    )
+    assert js(a[2])["values"] == js(b[2])["values"], "same ground point, same values"
+
+
+@check("colormap: interval form", "test_TilerFactory")
+def _():
+    cmap = urllib.parse.quote(json.dumps([
+        [[0, 100], [0, 0, 0, 255]],
+        [[100, 200], [255, 255, 255, 255]],
+        [[200, 300], [255, 0, 0, 255]],
+    ]), safe="")
+    code, h, _ = get(f"/cog/tiles/{Z}/{X}/{Y}.png?url={RGB}&bidx=1&colormap={cmap}")
+    assert code == 200, f"got {code}"
+    assert h["content-type"] == "image/png"
 
 
 # ---------------------------------------------------------------- routing

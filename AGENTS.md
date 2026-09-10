@@ -1,5 +1,22 @@
 # AGENTS.md
 
+## Drop-in compatibility with titiler is the goal
+
+The README states it: anything this server answers, it answers the way titiler
+would. That is a constraint on every change, not an aspiration.
+
+- **Never silently differ.** A parameter we do not implement is refused with a
+  400. Adding one that is accepted and ignored is the single change that must
+  never land — a client cannot tell a tile was rendered without it. The README
+  explains why, and `conformance.py` asserts it.
+- **Copy titiler's spelling.** Take the parameter name, its accepted forms and
+  its status codes from `titiler/src/titiler/core/tests/test_factories.py`, not
+  from memory. Accepting *more* than titiler is fine — `bidx=1,2,3` alongside
+  `bidx=1&bidx=2&bidx=3` — accepting something *different* is not.
+- When you implement one, delete it from `UNIMPLEMENTED` in `src/lib.rs`, from
+  `UNIMPLEMENTED` in `fixtures/conformance.py`, and from the README's gap
+  table. All three, in the same change.
+
 ## The parity tables move with the code
 
 `README.md` carries two tables under **Parity with titiler** — *Endpoints* and
@@ -30,6 +47,38 @@ The long-form version of the comparison is published at
 <https://claude.ai/code/artifact/c51b79f7-e768-4024-b2e2-68c08b72ddfe>. It is a
 snapshot, not a living doc — the README is the source of truth. Re-publish it
 only when asked.
+
+## Write the failing test first
+
+**Every fix starts with a test that fails for the reason you are about to fix.**
+Not after. The order is the point: a test written after the fix proves the code
+runs, while a test written before it proves the test can detect the bug at all.
+A check that would have passed against the broken code is worth nothing, and
+you cannot tell which kind you have written unless you watched it fail.
+
+The loop, every time:
+
+1. Reproduce the failure as a check — a fixture in `fixtures/`, a case in
+   `check.py` or `conformance.py`, or a `#[test]` in a dependency-free module.
+2. Run it. **Watch it fail, and read the failure.** If it passes, or fails for
+   a different reason than the bug, the check is wrong — fix the check before
+   touching the code.
+3. Make the change.
+4. Run it again and watch it pass, then run the whole gate.
+
+This is not ceremony, and this repo has the scars to prove it:
+
+- The trailing-overview COG fix shipped with a fixture built *afterwards*. The
+  first version of that fixture put the overview IFDs 117 KB in, inside a
+  single read — it would have passed against the unfixed code. It only became
+  a real test once it was enlarged, which was luck, not method.
+- The tile cache once served pixels from a previous build, and a gate that had
+  not been made to fail first would have graded the wrong binary as green.
+
+When a bug cannot be reproduced locally — it needs a 1.4 GB file, or a
+Cloudflare CPU limit — say so in the commit message, and add the smallest
+fixture that exercises the same code path. `layout_trailing_overviews.tif` is
+that: `gdaladdo` reproduces NLCD's layout in 4 MB.
 
 ## Verify before claiming
 

@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use crate::colormap::{Colormap, BUILTIN};
 use crate::fail::{Fail, Out};
 use crate::query::Query;
-use crate::TILE;
 
 pub(crate) fn sample(data: &TypedArray, i: usize) -> f64 {
     match data {
@@ -29,8 +28,39 @@ pub(crate) fn sample(data: &TypedArray, i: usize) -> f64 {
 /// Reads titiler's two spellings. Returns `None` when neither is given.
 pub(crate) fn colormap(q: &Query) -> Out<Option<Colormap>> {
     if let Some(json) = q.last("colormap") {
-        let raw: HashMap<String, serde_json::Value> = serde_json::from_str(json)
+        let parsed: serde_json::Value = serde_json::from_str(json)
             .map_err(|e| Fail::bad(format!("colormap is not valid JSON: {e}")))?;
+
+        // The interval form: [[[min, max], [r,g,b,a]], ...]
+        if let Some(list) = parsed.as_array() {
+            let mut bins = Vec::with_capacity(list.len());
+            for (i, entry) in list.iter().enumerate() {
+                let pair = entry.as_array().filter(|p| p.len() == 2).ok_or_else(|| {
+                    Fail::bad(format!("colormap entry {i} is not [[min,max],[r,g,b,a]]"))
+                })?;
+                let range = pair[0].as_array().filter(|r| r.len() == 2).ok_or_else(|| {
+                    Fail::bad(format!("colormap entry {i}: range is not [min,max]"))
+                })?;
+                let (lo, hi) = (
+                    range[0].as_f64().ok_or_else(|| {
+                        Fail::bad(format!("colormap entry {i}: min is not a number"))
+                    })?,
+                    range[1].as_f64().ok_or_else(|| {
+                        Fail::bad(format!("colormap entry {i}: max is not a number"))
+                    })?,
+                );
+                if hi < lo {
+                    return Err(Fail::bad(format!("colormap entry {i}: max is below min")));
+                }
+                let colour = parse_colour(&pair[1])
+                    .map_err(|e| Fail::bad(format!("colormap entry {i}: {e}")))?;
+                bins.push(((lo, hi), colour));
+            }
+            return Ok(Some(Colormap::Intervals(bins)));
+        }
+
+        let raw: HashMap<String, serde_json::Value> = serde_json::from_value(parsed)
+            .map_err(|e| Fail::bad(format!("colormap is not a value map or interval list: {e}")))?;
         let mut table = HashMap::with_capacity(raw.len());
         for (k, v) in raw {
             let key = k
@@ -207,16 +237,28 @@ pub(crate) fn rescale(q: &Query, bands: usize) -> Out<(Vec<f64>, Vec<f64>)> {
     Ok((lo, hi))
 }
 
-pub(crate) fn png_response(rgba: &[u8]) -> Out<Response> {
+/// `rgba` is always RGBA; `with_alpha` decides whether the alpha channel
+/// reaches the PNG, which is titiler's `return_mask`.
+pub(crate) fn png_response(rgba: &[u8], size: usize, with_alpha: bool) -> Out<Response> {
     let mut buf = Vec::new();
+    let dropped: Vec<u8> = if with_alpha {
+        Vec::new()
+    } else {
+        rgba.chunks(4).flat_map(|p| p[..3].to_vec()).collect()
+    };
+    let pixels: &[u8] = if with_alpha { rgba } else { &dropped };
     {
-        let mut enc = png::Encoder::new(&mut buf, TILE as u32, TILE as u32);
-        enc.set_color(png::ColorType::Rgba);
+        let mut enc = png::Encoder::new(&mut buf, size as u32, size as u32);
+        enc.set_color(if with_alpha {
+            png::ColorType::Rgba
+        } else {
+            png::ColorType::Rgb
+        });
         enc.set_depth(png::BitDepth::Eight);
         let mut w = enc
             .write_header()
             .map_err(|e| Fail::from(Error::RustError(format!("png: {e}"))))?;
-        w.write_image_data(rgba)
+        w.write_image_data(pixels)
             .map_err(|e| Fail::from(Error::RustError(format!("png: {e}"))))?;
     }
     let mut resp = Response::from_bytes(buf)?;

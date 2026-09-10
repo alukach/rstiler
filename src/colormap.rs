@@ -36,6 +36,9 @@ pub(crate) enum Colormap {
     /// `colormap={"11":[70,107,159,255],...}` — looked up on the *raw* value,
     /// before any rescale. This is what categorical rasters need.
     Discrete(HashMap<i64, [u8; 4]>),
+    /// `colormap=[[[min,max],[r,g,b,a]], ...]` — half-open ranges over the raw
+    /// value, for binning continuous data.
+    Intervals(Vec<((f64, f64), [u8; 4])>),
 }
 
 impl Colormap {
@@ -44,6 +47,15 @@ impl Colormap {
     pub(crate) fn lookup(&self, rescaled: u8, raw: f64) -> Option<[u8; 4]> {
         match self {
             Self::Discrete(table) => table.get(&(raw.round() as i64)).copied(),
+            // Half-open, so touching ranges do not overlap. The last one
+            // includes its upper bound, or the top value would fall through.
+            Self::Intervals(bins) => bins
+                .iter()
+                .enumerate()
+                .find(|(i, ((lo, hi), _))| {
+                    raw >= *lo && (raw < *hi || (*i == bins.len() - 1 && raw == *hi))
+                })
+                .map(|(_, (_, c))| *c),
             Self::Continuous(stops) => {
                 let window = stops
                     .windows(2)
@@ -102,6 +114,28 @@ mod tests {
                 assert!(cm.lookup(v, 0.0).is_some(), "{name} missed {v}");
             }
         }
+    }
+
+    #[test]
+    fn intervals_are_half_open_and_can_miss() {
+        let cm = Colormap::Intervals(vec![
+            ((0.0, 100.0), [1, 1, 1, 255]),
+            ((100.0, 200.0), [2, 2, 2, 255]),
+        ]);
+        assert_eq!(cm.lookup(0, 0.0), Some([1, 1, 1, 255]));
+        assert_eq!(cm.lookup(0, 99.9), Some([1, 1, 1, 255]));
+        assert_eq!(
+            cm.lookup(0, 100.0),
+            Some([2, 2, 2, 255]),
+            "half-open: 100 is the next bin"
+        );
+        assert_eq!(
+            cm.lookup(0, 200.0),
+            Some([2, 2, 2, 255]),
+            "the last bin includes its top"
+        );
+        assert_eq!(cm.lookup(0, 200.1), None, "outside every bin");
+        assert_eq!(cm.lookup(0, -1.0), None);
     }
 
     #[test]

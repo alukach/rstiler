@@ -305,7 +305,7 @@ pub(crate) async fn point(src: &str, coords: &str, q: &Query) -> Out<Response> {
         .filter_map(|v| v.trim().parse().ok())
         .collect();
     let [lon, lat] = parsed[..] else {
-        return Err(Fail::bad(format!("expected `lon,lat`, got {coords:?}")));
+        return Err(Fail::bad(format!("expected `x,y`, got {coords:?}")));
     };
 
     let cog = Cog::open(src).await?;
@@ -314,7 +314,21 @@ pub(crate) async fn point(src: &str, coords: &str, q: &Query) -> Out<Response> {
     let t = transform_of(ifd)?;
     let crs = source_crs(ifd)?;
 
-    let (wx, wy) = Reproject::between(&Crs::WGS84, &crs)?
+    // titiler's `coord_crs`: the coordinate can be given in any EPSG-coded
+    // CRS, not just WGS84.
+    let coord_crs = match q.last("coord_crs") {
+        Some(s) => Crs::Epsg(
+            s.trim()
+                .strip_prefix("EPSG:")
+                .or_else(|| s.trim().strip_prefix("epsg:"))
+                .unwrap_or(s.trim())
+                .parse()
+                .map_err(|_| Fail::bad(format!("coord_crs {s:?} is not an EPSG code")))?,
+        ),
+        None => Crs::WGS84,
+    };
+
+    let (wx, wy) = Reproject::between(&coord_crs, &crs)?
         .apply(lon, lat)
         .ok_or_else(|| Fail::bad("point is outside the CRS's domain"))?;
     let (fx, fy) = t.world_to_pixel(wx, wy, 1.0);

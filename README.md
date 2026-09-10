@@ -1,8 +1,61 @@
 # rstiler
 
-A prototype of [titiler](https://github.com/developmentseed/titiler), written in
-Rust and running on Cloudflare Workers. `rs` for Rust, and because r-s-t: it is
-the one that comes just before titiler.
+A [titiler](https://github.com/developmentseed/titiler) written in Rust and
+running on Cloudflare Workers. `rs` for Rust, and because r-s-t: it is the one
+that comes just before titiler.
+
+## The goal: a drop-in replacement for titiler
+
+**Anything rstiler answers, it answers the way titiler would.** Same routes,
+same parameter names, same semantics, same status codes — so a client, a
+MapLibre layer or a TileJSON consumer written against titiler can be pointed at
+rstiler without changing a line.
+
+Three rules hold that goal in place:
+
+1. **Never silently differ.** A parameter rstiler does not implement is
+   refused with a `400` that says so. It is *not* ignored. A client that asked
+   for `expression=(b8-b4)/(b8+b4)` and got a plausible tile back has no way to
+   know it received raw band 1 instead — a loud failure is the only honest
+   answer while a gap remains.
+2. **Copy titiler's spelling, never invent one.** New parameters take
+   titiler's name, its accepted forms, and its status codes. Where rstiler
+   accepts more (`bidx=1,2,3` alongside `bidx=1&bidx=2&bidx=3`) it is a
+   superset, never a substitute.
+3. **The gap list is executable.** `fixtures/conformance.py` encodes titiler's
+   own test suite, and its `UNIMPLEMENTED` dict is the list below. It shrinks
+   by deleting entries, never by softening an assertion.
+
+### What is not there yet
+
+Everything here is **refused with a 400**, not quietly dropped, so you find out
+at the first request rather than from a wrong-looking map.
+
+| Not implemented | Notes |
+|---|---|
+| `color_formula` | rio-color gamma / sigmoidal / saturation |
+| `buffer`, `padding` | rendering beyond the tile edge |
+| `algorithm`, `algorithm_params` | titiler's post-processing hooks |
+| `dst_crs` | rendering into a CRS other than Web Mercator |
+| `tileMatrixSetId` | WebMercatorQuad is assumed, not selected — the path form `/cog/tiles/{tms}/{z}/{x}/{y}` is a 404 |
+| `format`, `width`, `height`, `max_size` | PNG at `tilesize` only; `.jpg`, `.tif`, `.npy` are refused |
+
+Endpoints titiler has and rstiler does not — all `404`: `/cog/preview`,
+`/cog/bbox`, `/cog/feature`, `/cog/WMTSCapabilities.xml`, `/cog/info.geojson`,
+`/cog/validate`, `/cog/map`, and the whole of `titiler.mosaic` (MosaicJSON),
+`titiler.xarray` (Zarr/NetCDF) and the STAC surface.
+
+Two places where rstiler answers but not identically, and both are visible in
+the response rather than hidden:
+
+- **`/cog/statistics` is sampled**, not a full pass: it reads a subset of one
+  overview level. The field *names* match `rio_tiler.models.BandStatistics`, and
+  `histogram`, `majority`, `minority` and `unique` are absent. Good enough to
+  pick a rescale; not a substitute for real statistics.
+- **Formats rstiler cannot decode** are a `400` at tile time: LERC (its decoder
+  is C and needs a wasm libc) and JPEG-XL (async-tiff has none). Stripped
+  (non-tiled) TIFFs and rasters carrying a `ModelTransformation` instead of
+  `ModelPixelScale` are likewise refused.
 
 COGs are read over HTTP range requests
 with [`async-tiff`](https://github.com/developmentseed/async-tiff), reprojected
@@ -67,7 +120,7 @@ architecture comparison and the measurements behind it, lives at
 | `/cog/info` | yes | extended | adds per-band 2nd/98th percentiles |
 | `/cog/viewer` | yes | yes | MapLibre, with the source.coop example list |
 | `/cog/statistics` | yes | partial | sampled from one overview level, not a full pass; no histogram |
-| `/cog/point/{lon},{lat}` | yes | yes | WGS84 only; no `coord_crs` |
+| `/cog/point/{lon},{lat}` | yes | yes | `coord_crs` supported |
 | `/cog/preview` | yes | no | |
 | `/cog/bbox/…` | yes | no | |
 | `/cog/feature` | yes | no | needs geometry masking |
@@ -86,9 +139,14 @@ the STAC surface, and the OpenAPI schema FastAPI generates for free.
 | `bidx` | yes | 1-based; repeated (`bidx=1&bidx=2`) or comma-separated. Repeats are kept, as titiler does |
 | `rescale` | yes | `min,max`; repeated or `;`-separated for per-band ranges |
 | `nodata` | yes | overrides the dataset's `GDAL_NODATA` |
+| `expression` | partial | arithmetic over bands — `(b8-b4)/(b8+b4)`, `b1*0.0001`, `;`-separated for multiple outputs. titiler evaluates these with numexpr, so comparisons and functions are not supported |
+| `unscale` | yes | applies the scale/offset GDAL keeps in its metadata XML |
+| `return_mask` | yes | `false` drops the alpha band |
+| `tilesize` | yes | 64–1024, a multiple of 16 |
+| `coord_crs` | yes | on `/cog/point`; any EPSG code |
 | `resampling` | partial | `nearest` (default) and `bilinear`; no cubic/lanczos/average |
 | `colormap_name` | partial | `viridis`, `magma`, `plasma`, `inferno`, `cividis`, `terrain`, `greys` |
-| `colormap` | partial | discrete `{"value": [r,g,b] \| [r,g,b,a] \| "#rrggbb" \| "#rrggbbaa"}`; no interval form |
+| `colormap` | yes | discrete `{"value": [r,g,b] \| [r,g,b,a] \| "#rrggbb" \| "#rrggbbaa"}` and intervals `[[[min,max],[r,g,b,a]], ...]` |
 | `expression` | no | no band math |
 | `color_formula` | no | |
 | `unscale` | no | internal scale/offset ignored |
@@ -115,7 +173,7 @@ Still unsupported: a rotated or sheared raster, which carries a
 `fixtures/conformance.py` encodes titiler's own contract — every assertion cites
 the test in `titiler/src/titiler/core/tests/test_factories.py` it came from — so
 a client written against titiler behaves the same way here for the subset we
-implement. **23 of 23 pass.**
+implement. **34 of 34 pass.**
 
 It found real incompatibilities, not cosmetic ones:
 
@@ -131,11 +189,8 @@ It found real incompatibilities, not cosmetic ones:
   (`band_metadata`, `band_descriptions`, `dtype`, `nodata_type`; `sum`, `std`,
   `median`, `valid_percent`, `masked_pixels`, `valid_pixels`, `description`).
 
-The suite also lists what is not implemented — `expression`, output formats
-other than PNG, `coord_crs`/`dst_crs`, `tileMatrixSetId` in the path,
-`info.geojson`, `preview`/`bbox`/`feature`, colormap intervals, `algorithm`,
-and `histogram`/`majority`/`minority`/`unique` in statistics. That list is the
-conformance gap, and it shrinks by deleting entries, never by weakening a check.
+The suite's `UNIMPLEMENTED` dict is the gap list at the top of this README.
+It shrinks by deleting entries, never by weakening a check.
 
 ### What has been verified
 
@@ -291,7 +346,10 @@ datum grid shifts, which is far below one pixel.
 | `src/tiles.rs` | the tile handler: the resampling pipeline |
 | `src/meta.rs` | `/cog/info` and `/cog/tilejson.json` |
 | `src/render.rs` | query parameters, resampling, samples → 8-bit RGBA → PNG |
-| `src/query.rs` | repeated query parameters, titiler's spelling |
+| `src/query.rs` | repeated query parameters, and refusing unknown ones |
+| `src/expression.rs` | band math (dependency-free, self-tests) |
+| `src/gdalmeta.rs` | scale/offset out of GDAL's metadata XML |
+| `src/warp.rs` | grid-approximated reprojection |
 | `src/fail.rs` | failures that carry the status code to report |
 | `src/colormap.rs` | the colour tables (dependency-free, so it self-tests) |
 | `src/viewer.html` | the example viewer |
@@ -355,12 +413,11 @@ and colormaps producing colour.
 Its `KNOWN_GAPS` dict is **the gap list in executable form** — each entry names a
 fixture and why it cannot render. A file that fails without an entry is a
 regression and fails the run; a file that starts passing prints `FIXED` and tells
-you to delete its entry. Current state: **20 of 26 render, 6 declared gaps.**
+you to delete its entry. Current state: **22 of 27 render, 5 declared gaps.**
 
 | Gap | Fixture |
 |---|---|
 | `ModelTransformation` instead of `ModelPixelScale` | `crs_rotated_sar`, `layout_bigtiff_subifd` |
-| `PlanarConfiguration=2` band reassembly | `layout_planar` |
 | Stripped (non-tiled) TIFFs | `layout_stripped` |
 | LERC — the decoder is C, needs a wasm libc | `compress_lerc` |
 | JPEG-XL — `async-tiff` has no decoder | `compress_jpegxl` |

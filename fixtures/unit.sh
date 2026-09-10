@@ -9,7 +9,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
 fail=0
-for m in tiling colormap query; do
+for m in tiling colormap query expression gdalmeta; do
   if ! out=$(rustc --test "src/$m.rs" -o "/tmp/unit_$m" 2>&1); then
     printf "  FAIL  %-9s did not compile\n%s\n" "$m" "$out"; fail=1; continue
   fi
