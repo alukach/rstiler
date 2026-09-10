@@ -14,6 +14,7 @@ import json
 import math
 import os
 import pathlib
+import re
 import struct
 import subprocess
 import sys
@@ -52,6 +53,21 @@ def curl(path, out="/tmp/check_body.bin", timeout=120):
          "-w", "%{http_code}", TILER + path],
         capture_output=True, text=True, check=False).stdout.strip()
     return code, pathlib.Path(out)
+
+
+def curl_headers(path, timeout=120):
+    """(status, headers) — curl() discards headers, and the timing is the point."""
+    hdr = "/tmp/check_head.txt"
+    code = subprocess.run(
+        ["curl", "-s", "--max-time", str(timeout), *NO_CACHE, "-o", "/dev/null",
+         "-D", hdr, "-w", "%{http_code}", TILER + path],
+        capture_output=True, text=True, check=False).stdout.strip()
+    headers = {}
+    for line in pathlib.Path(hdr).read_text(errors="replace").splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            headers[k.strip().lower()] = v.strip()
+    return code, headers
 
 
 def detail(p):
@@ -223,7 +239,34 @@ def assertions():
         print(f"  {'ok' if okp else 'FAIL'}    point through EPSG:{v:<6}        {','.join(got)}")
         if not okp: bad.append(f"point/{v}")
 
-    # 4. A colormap must produce colour, not grey.
+    # 4. A tile must not cost one subrequest per source tile. Cloudflare caps
+    #    subrequests per invocation (50 on the free plan), so a render needing
+    #    many source tiles has to coalesce their byte ranges or it fails
+    #    outright rather than merely slowly.
+    # A unique source URL, so the byte-range cache is cold too: Cache-Control
+    # only bypasses the *tile* cache, and cached ranges are not counted as
+    # reads — which would make this check pass without any coalescing at all.
+    # serve.py ignores the query string when resolving the path.
+    fresh = url_for(f"synthetic_no_overviews.tif?cold={os.getpid()}")
+    code, hdr = curl_headers(f"/cog/tiles/6/18/24.png?url={fresh}")
+    timing = hdr.get("server-timing", "")
+    tiles = re.search(r'desc="(\d+) tiles"', timing)
+    reads = re.search(r'desc="(\d+) reads', timing)
+    if code == "200" and tiles and reads:
+        n_tiles, n_reads = int(tiles.group(1)), int(reads.group(1))
+        # Tiles in a row are contiguous on disk, so a row should cost one read.
+        # Allow the rows plus slack for the metadata reads.
+        budget = max(8, n_tiles // 2)
+        okc = n_reads <= budget
+        print(f"  {'ok' if okc else 'FAIL'}    subrequests are coalesced       "
+              f"{n_tiles} source tiles in {n_reads} reads (budget {budget})")
+        if not okc:
+            bad.append("subrequests")
+    else:
+        print(f"  FAIL  subrequests are coalesced       no timing: {code} {timing!r}")
+        bad.append("subrequests")
+
+    # 5. A colormap must produce colour, not grey.
     base = f"/cog/tiles/{Z}/{X}/{Y}.png?url={url_for('synthetic_dem_int16.tif')}&rescale=-2000,8000"
     curl(base + "&colormap_name=viridis", "/tmp/v.png")
     curl(base + "&colormap_name=greys", "/tmp/g.png")

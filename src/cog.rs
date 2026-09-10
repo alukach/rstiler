@@ -54,6 +54,15 @@ impl HttpReader {
     }
 }
 
+/// How much unwanted data is worth reading to avoid a second request. Tiles
+/// in a COG row are usually contiguous, so this mostly closes gaps left by
+/// tiles outside the window rather than bridging real distance.
+const MERGE_GAP: u64 = 64 * 1024;
+
+/// Ceiling on one merged read, so a scattered set of ranges cannot be joined
+/// into something that will not fit in a Worker's memory.
+const MAX_SPAN: u64 = 16 * 1024 * 1024;
+
 /// Prefix that carries an origin status out through async-tiff's error type,
 /// so the router can map it to a status of its own. See `fail::upstream`.
 pub(crate) const HTTP_STATUS_MARKER: &str = "upstream HTTP ";
@@ -115,10 +124,66 @@ impl AsyncFileReader for HttpReader {
     }
 
     /// The trait's default implementation awaits each range in turn, so a tile
-    /// needing N source tiles cost N round trips. Issue them together instead;
-    /// the runtime caps concurrent connections and queues the rest.
+    /// needing N source tiles cost N round trips. Issue them together — and
+    /// first merge the ones that sit next to each other on disk.
+    ///
+    /// Coalescing is not only an optimisation here. Cloudflare caps
+    /// subrequests per invocation (50 on the free plan, 1000 on paid), and a
+    /// low zoom over a COG with a shallow pyramid can want a hundred source
+    /// tiles. One request each and the render fails outright. A COG stores
+    /// tiles in row-major order, so a run across a row is contiguous and
+    /// collapses into a single read.
     async fn get_byte_ranges(&self, ranges: Vec<Range<u64>>) -> AsyncTiffResult<Vec<Bytes>> {
-        futures::future::try_join_all(ranges.into_iter().map(|r| self.get_bytes(r))).await
+        if ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Merge in disk order, remembering which span each caller's range came
+        // from so the results can be handed back in the order asked for.
+        let mut order: Vec<usize> = (0..ranges.len()).collect();
+        order.sort_by_key(|&i| ranges[i].start);
+
+        let mut spans: Vec<Range<u64>> = Vec::new();
+        let mut owner = vec![0usize; ranges.len()];
+        for &i in &order {
+            let r = &ranges[i];
+            match spans.last_mut() {
+                // Reading across a small gap costs less than a second request.
+                Some(last)
+                    if r.start <= last.end.saturating_add(MERGE_GAP)
+                        && r.end.saturating_sub(last.start) <= MAX_SPAN =>
+                {
+                    last.end = last.end.max(r.end);
+                }
+                _ => spans.push(r.clone()),
+            }
+            owner[i] = spans.len() - 1;
+        }
+
+        let fetched =
+            futures::future::try_join_all(spans.iter().cloned().map(|s| self.get_bytes(s))).await?;
+
+        ranges
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let span = &spans[owner[i]];
+                let bytes = &fetched[owner[i]];
+                let (from, to) = (
+                    (r.start - span.start) as usize,
+                    (r.end - span.start) as usize,
+                );
+                if to > bytes.len() {
+                    return Err(AsyncTiffError::General(format!(
+                        "short read: wanted {}..{} of a {}-byte span",
+                        from,
+                        to,
+                        bytes.len()
+                    )));
+                }
+                Ok(bytes.slice(from..to))
+            })
+            .collect()
     }
 }
 

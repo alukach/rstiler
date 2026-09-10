@@ -77,12 +77,14 @@ use tiles::tile;
 
 /// Output tile size. titiler defaults to 256; so do we.
 pub(crate) const TILE: usize = 256;
-/// Refuse to assemble a tile out of more source tiles than this. Each one is a
-/// subrequest, and Workers caps those per request (1000 paid, 50 free), so the
-/// ceiling is the platform's, not an arbitrary one. A COG whose overview
-/// pyramid stops well short of the zoom being asked for genuinely needs this
-/// many reads — the whole coarsest level is often only a couple of hundred
-/// tiles, so this is bounded, not runaway.
+/// Refuse to assemble a tile out of more source tiles than this.
+///
+/// It used to be the subrequest budget that bound this — one request per tile,
+/// against a cap of 50 on the free plan. `HttpReader::get_byte_ranges` now
+/// merges adjacent ranges, so 90 source tiles cost about 10 requests and the
+/// binding constraint is decode CPU instead. A COG whose pyramid stops short
+/// of the zoom asked for genuinely needs this many tiles; the whole coarsest
+/// level is often only a couple of hundred, so this stays bounded.
 pub(crate) const MAX_SOURCE_TILES: usize = 256;
 /// EPSG code of the tile grid we serve.
 pub(crate) const WEB_MERCATOR: u16 = 3857;

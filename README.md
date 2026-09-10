@@ -267,6 +267,29 @@ four reads of 128 KiB. `layout_trailing_overviews.tif` is the regression
 fixture — `gdaladdo` on a plain TIFF appends overviews after the image data,
 reproducing the layout exactly.
 
+### One request per source tile was the other ceiling
+
+Cloudflare caps subrequests per invocation — 50 on the free plan, 1000 on paid
+— and a low zoom over a COG with a shallow pyramid can want a hundred source
+tiles. At one request each that is not slow, it is a hard failure: *Too many
+subrequests by single Worker invocation*.
+
+A COG stores tiles in row-major order, so a run across a row is contiguous on
+disk. `HttpReader::get_byte_ranges` merges ranges that sit within 64 KiB of
+each other (capped at 16 MiB per read, so scattered ranges cannot be joined
+into something that will not fit in memory):
+
+| | source tiles | requests |
+|---|---|---|
+| before | 90 | 92 |
+| after | 90 | **10** |
+
+`check.py` guards it by reading the `Server-Timing` header and asserting the
+read count stays well under the tile count. That check has to defeat *two*
+caches to mean anything — `Cache-Control: no-cache` for the rendered tile, and
+a unique source URL for the byte ranges, since cached ranges are not counted as
+reads and the check would otherwise pass without any coalescing at all.
+
 ### CPU is the tighter budget
 
 A Cloudflare Worker on the free plan gets **10 ms of CPU per request**; the
